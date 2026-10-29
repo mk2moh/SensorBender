@@ -9,10 +9,13 @@
 
 enum { S_ACCEL, S_GYRO, S_MAG, S_USERACCEL, S_GRAVITY, S_ROTRATE, S_MAGCAL, S_ATT, S_COUNT };
 enum { E_PRESSURE, E_RELALT, E_COUNT };
+enum { U_MASK, U_APP_STATE, U_SCENE_STATE, U_PROTECTED_DATA, U_SCREEN_BRIGHTNESS, U_LIFECYCLE_NOTIFICATIONS, U_COUNT };
 
 static BOOL gEnabled = YES;
 static BOOL gExtraEnabled[E_COUNT];
 static BOOL gAppEnabled = YES;
+static BOOL gUsageMaskOption[U_COUNT];
+static __thread BOOL gSBReadActualLifecycleState = NO;
 static NSString *gAppBundleID = nil;
 static BOOL gSensorEnabled[S_COUNT];
 static BOOL gSensorAdv[S_COUNT];
@@ -35,6 +38,50 @@ static double readD(id source, NSString *k, double def){ id v=[source objectForK
 static BOOL readB(id source, NSString *k, BOOL def){ id v=[source objectForKey:k]; return v?[v boolValue]:def; }
 static inline double M(int s, int a){ return gSensorAdv[s] ? gAxis[s][a] : gBase[s]; }
 static BOOL SBShouldShowOverlay(void){ return NSBundle.mainBundle.bundleIdentifier.length > 0; }
+static BOOL SBUsageMaskIsActive(void){ return gEnabled && gAppEnabled && gUsageMaskOption[U_MASK]; }
+static UIApplicationState SBActualApplicationState(void){
+    BOOL previous=gSBReadActualLifecycleState; gSBReadActualLifecycleState=YES;
+    UIApplicationState state=[UIApplication sharedApplication].applicationState;
+    gSBReadActualLifecycleState=previous;
+    return state;
+}
+static UISceneActivationState SBActualSceneActivationState(UIScene *scene){
+    if(!scene) return UISceneActivationStateUnattached;
+    BOOL previous=gSBReadActualLifecycleState; gSBReadActualLifecycleState=YES;
+    UISceneActivationState state=scene.activationState;
+    gSBReadActualLifecycleState=previous;
+    return state;
+}
+
+// Best-effort per-process masking of public app/screen state queries.
+%hook UIApplication
+- (UIApplicationState)applicationState{
+    UIApplicationState actual=%orig;
+    if(!gSBReadActualLifecycleState && SBUsageMaskIsActive() && gUsageMaskOption[U_APP_STATE]) return UIApplicationStateActive;
+    return actual;
+}
+- (BOOL)isProtectedDataAvailable{
+    BOOL actual=%orig;
+    if(SBUsageMaskIsActive() && gUsageMaskOption[U_PROTECTED_DATA]) return YES;
+    return actual;
+}
+%end
+
+%hook UIScene
+- (UISceneActivationState)activationState{
+    UISceneActivationState actual=%orig;
+    if(!gSBReadActualLifecycleState && SBUsageMaskIsActive() && gUsageMaskOption[U_SCENE_STATE]) return UISceneActivationStateForegroundActive;
+    return actual;
+}
+%end
+
+%hook UIScreen
+- (CGFloat)brightness{
+    CGFloat actual=%orig;
+    if(SBUsageMaskIsActive() && gUsageMaskOption[U_SCREEN_BRIGHTNESS]) return 1.0;
+    return actual;
+}
+%end
 
 // Keep compass headings consistent with the per-axis magnetometer multipliers.
 static __thread BOOL gSBRawCompassAxes=NO;
@@ -284,7 +331,7 @@ static void SBInstallCLLocationSubclassHooks(void){
     if(!base) return;
     int capacity=objc_getClassList(NULL,0);
     if(capacity<=0) return;
-    Class *classes=calloc((size_t)capacity,sizeof(Class));
+    Class __unsafe_unretained *classes=(Class __unsafe_unretained *)calloc((size_t)capacity,sizeof(Class));
     if(!classes) return;
     int count=objc_getClassList(classes,capacity);
     @synchronized([CLLocation class]) {
@@ -323,6 +370,12 @@ static void loadPrefs(void){
     id local=app?:d;
     gEnabled=YES;
     gAppEnabled=readB(local,@"appEnabled",YES);
+    gUsageMaskOption[U_MASK]=readB(local,@"usageMaskEnabled",NO);
+    gUsageMaskOption[U_APP_STATE]=readB(local,@"usageAppState",YES);
+    gUsageMaskOption[U_SCENE_STATE]=readB(local,@"usageSceneState",YES);
+    gUsageMaskOption[U_PROTECTED_DATA]=readB(local,@"usageProtectedData",YES);
+    gUsageMaskOption[U_SCREEN_BRIGHTNESS]=readB(local,@"usageScreenBrightness",NO);
+    gUsageMaskOption[U_LIFECYCLE_NOTIFICATIONS]=readB(local,@"usageLifecycleNotifications",NO);
     NSArray *keys=sensorKeys(); NSArray *ax=axisLetters();
     for(int s=0;s<S_COUNT;s++){
         NSString *ek=[NSString stringWithFormat:@"%@Enabled",keys[s]];
@@ -350,6 +403,12 @@ static void savePrefs(void){
     NSMutableDictionary *app=[NSMutableDictionary dictionary];
     NSArray *keys=sensorKeys(); NSArray *ax=axisLetters();
     app[@"appEnabled"]=@(gAppEnabled);
+    app[@"usageMaskEnabled"]=@(gUsageMaskOption[U_MASK]);
+    app[@"usageAppState"]=@(gUsageMaskOption[U_APP_STATE]);
+    app[@"usageSceneState"]=@(gUsageMaskOption[U_SCENE_STATE]);
+    app[@"usageProtectedData"]=@(gUsageMaskOption[U_PROTECTED_DATA]);
+    app[@"usageScreenBrightness"]=@(gUsageMaskOption[U_SCREEN_BRIGHTNESS]);
+    app[@"usageLifecycleNotifications"]=@(gUsageMaskOption[U_LIFECYCLE_NOTIFICATIONS]);
     for(int s=0;s<S_COUNT;s++){
         app[[NSString stringWithFormat:@"%@Enabled",keys[s]]]=@(gSensorEnabled[s]);
         app[[NSString stringWithFormat:@"%@Adv",keys[s]]]=@(gSensorAdv[s]);
@@ -507,16 +566,17 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     NSMutableDictionary *_sliders; NSMutableDictionary *_valueLabels; NSMutableDictionary *_liveLabels;
     NSMutableDictionary *_sensorHeaders; NSMutableDictionary *_absRows; NSMutableDictionary *_advContainers;
     UISwitch *_enabledSwitch; UISwitch *_gpsAdjustmentsSwitch;
+    NSMutableDictionary *_usageSwitches;
     NSTimer *_liveTimer;
     BOOL _didAutoOpenPanel; BOOL _autoOpenScheduled;
     CGPoint _panStart;
 }
 + (instancetype)shared{ static SBSensorBenderOverlay *s; static dispatch_once_t t; dispatch_once(&t,^{s=[SBSensorBenderOverlay new];}); return s; }
 - (void)installIfNeeded{
-    if(!SBShouldShowOverlay() || [UIApplication sharedApplication].applicationState==UIApplicationStateBackground) return;
+    if(!SBShouldShowOverlay() || SBActualApplicationState()==UIApplicationStateBackground) return;
     if(_floatWindow){
         dispatch_async(dispatch_get_main_queue(),^{
-            if(SBShouldShowOverlay() && [UIApplication sharedApplication].applicationState!=UIApplicationStateBackground){
+            if(SBShouldShowOverlay() && SBActualApplicationState()!=UIApplicationStateBackground){
                 self->_floatWindow.hidden=NO;
                 [self scheduleAutoOpenPanel];
             }
@@ -524,12 +584,12 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
         return;
     }
     dispatch_async(dispatch_get_main_queue(),^{
-        if(SBShouldShowOverlay() && [UIApplication sharedApplication].applicationState!=UIApplicationStateBackground && !self->_floatWindow) [self createWindow];
+        if(SBShouldShowOverlay() && SBActualApplicationState()!=UIApplicationStateBackground && !self->_floatWindow) [self createWindow];
         else if(SBShouldShowOverlay() && self->_floatWindow) [self scheduleAutoOpenPanel];
     });
 }
 - (void)reconcileVisibility{
-    if(SBShouldShowOverlay() && [UIApplication sharedApplication].applicationState!=UIApplicationStateBackground) [self installIfNeeded];
+    if(SBShouldShowOverlay() && SBActualApplicationState()!=UIApplicationStateBackground) [self installIfNeeded];
     else dispatch_async(dispatch_get_main_queue(),^{ self->_panelWindow.hidden=YES; self->_floatWindow.hidden=YES; });
 }
 - (void)scheduleAutoOpenPanel{
@@ -537,7 +597,7 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     _autoOpenScheduled=YES;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(0.45*NSEC_PER_SEC)),dispatch_get_main_queue(),^{
         self->_autoOpenScheduled=NO;
-        if(self->_didAutoOpenPanel || !SBShouldShowOverlay() || [UIApplication sharedApplication].applicationState!=UIApplicationStateActive || !self->_panelWindow) return;
+        if(self->_didAutoOpenPanel || !SBShouldShowOverlay() || SBActualApplicationState()!=UIApplicationStateActive || !self->_panelWindow) return;
         self->_didAutoOpenPanel=YES;
         if(self->_panelWindow.hidden) [self togglePanel];
     });
@@ -546,13 +606,13 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     UIWindowScene *fallback=nil;
     for(UIScene *scene in [UIApplication sharedApplication].connectedScenes){
         if(![scene isKindOfClass:[UIWindowScene class]]) continue;
-        if(scene.activationState==UISceneActivationStateForegroundActive) return (UIWindowScene*)scene;
-        if(scene.activationState==UISceneActivationStateForegroundInactive && !fallback) fallback=(UIWindowScene*)scene;
+        if(SBActualSceneActivationState(scene)==UISceneActivationStateForegroundActive) return (UIWindowScene*)scene;
+        if(SBActualSceneActivationState(scene)==UISceneActivationStateForegroundInactive && !fallback) fallback=(UIWindowScene*)scene;
     }
     return fallback;
 }
 - (void)createWindow{
-    if(!SBShouldShowOverlay() || [UIApplication sharedApplication].applicationState==UIApplicationStateBackground) return;
+    if(!SBShouldShowOverlay() || SBActualApplicationState()==UIApplicationStateBackground) return;
     UIWindowScene *scene=[self findWindowScene];
     CGRect floatFrame=CGRectMake(20,90,gBtnSize,gBtnSize);
     // Float window - tiny, only button area, never blocks app
@@ -622,6 +682,7 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     ]];
     _sliders=[NSMutableDictionary dictionary]; _valueLabels=[NSMutableDictionary dictionary]; _liveLabels=[NSMutableDictionary dictionary];
     _sensorHeaders=[NSMutableDictionary dictionary]; _absRows=[NSMutableDictionary dictionary]; _advContainers=[NSMutableDictionary dictionary];
+    _usageSwitches=[NSMutableDictionary dictionary];
     [self buildCard];
     _liveTimer=[NSTimer scheduledTimerWithTimeInterval:0.25 target:self selector:@selector(updateLive) userInfo:nil repeats:YES];
     [self scheduleAutoOpenPanel];
@@ -760,6 +821,18 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     [row addSubview:stack]; [NSLayoutConstraint activateConstraints:@[[stack.topAnchor constraintEqualToAnchor:row.topAnchor constant:8],[stack.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:10],[stack.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-10],[stack.bottomAnchor constraintEqualToAnchor:row.bottomAnchor constant:-8]]];
     return row;
 }
+- (UIView*)usageOptionRowWithTitle:(NSString*)title detail:(NSString*)detail option:(int)option{
+    UIView *row=[UIView new]; row.backgroundColor=[UIColor secondarySystemGroupedBackgroundColor]; row.layer.cornerRadius=10; row.layer.borderWidth=0.5; row.layer.borderColor=[UIColor separatorColor].CGColor; row.layer.masksToBounds=YES;
+    UILabel *heading=[UILabel new]; heading.text=title; heading.font=[UIFont systemFontOfSize:13 weight:UIFontWeightMedium]; heading.numberOfLines=0;
+    UILabel *explanation=[UILabel new]; explanation.text=detail; explanation.font=[UIFont systemFontOfSize:10]; explanation.textColor=[UIColor secondaryLabelColor]; explanation.numberOfLines=0;
+    UIStackView *copy=[[UIStackView alloc] initWithArrangedSubviews:@[heading,explanation]]; copy.axis=UILayoutConstraintAxisVertical; copy.spacing=3;
+    UISwitch *sw=[UISwitch new]; sw.on=gUsageMaskOption[option]; sw.tag=option; sw.transform=CGAffineTransformMakeScale(0.72,0.72); [sw addTarget:self action:@selector(usageMaskToggle:) forControlEvents:UIControlEventValueChanged];
+    _usageSwitches[[NSString stringWithFormat:@"%d",option]]=sw;
+    UIStackView *line=[[UIStackView alloc] initWithArrangedSubviews:@[copy,sw]]; line.axis=UILayoutConstraintAxisHorizontal; line.spacing=8; line.alignment=UIStackViewAlignmentCenter; line.translatesAutoresizingMaskIntoConstraints=NO;
+    [row addSubview:line];
+    [NSLayoutConstraint activateConstraints:@[[line.topAnchor constraintEqualToAnchor:row.topAnchor constant:8],[line.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:10],[line.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-6],[line.bottomAnchor constraintEqualToAnchor:row.bottomAnchor constant:-8]]];
+    return row;
+}
 - (void)buildCard{
     UILabel *t=[UILabel new]; t.text=@"SensorBender"; t.font=[UIFont systemFontOfSize:22 weight:UIFontWeightSemibold]; t.textAlignment=NSTextAlignmentLeft; [_stack addArrangedSubview:t];
     UILabel *sub=[UILabel new]; sub.text=@"Motion and location controls"; sub.font=[UIFont systemFontOfSize:13]; sub.textColor=[UIColor secondaryLabelColor]; sub.numberOfLines=0; sub.textAlignment=NSTextAlignmentLeft; [_stack addArrangedSubview:sub];
@@ -788,6 +861,14 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     [_stack addArrangedSubview:[self rowForKey:@"gpsSpeed" label:@"GPS speed scale" min:0.1 max:1.0]];
     UILabel *gpsHint=[UILabel new]; gpsHint.text=@"Positive smoothing increases filtering; negative values amplify changes. Speed scale multiplies the adjusted path: 0 pauses it, negative values reverse it, and values above 1 speed it up. This is separate from acceleration scaling."; gpsHint.font=[UIFont systemFontOfSize:10]; gpsHint.textColor=[UIColor secondaryLabelColor]; gpsHint.numberOfLines=0; [_stack addArrangedSubview:gpsHint];
     _gpsLiveLabel=[UILabel new]; _gpsLiveLabel.font=[UIFont monospacedDigitSystemFontOfSize:9 weight:UIFontWeightRegular]; _gpsLiveLabel.textColor=[UIColor secondaryLabelColor]; _gpsLiveLabel.numberOfLines=0; _gpsLiveLabel.text=@"GPS check: waiting for Core Location reads"; [_stack addArrangedSubview:_gpsLiveLabel];
+    [_stack addArrangedSubview:[self section:@"Usage privacy · best effort"]];
+    UILabel *targetInfo=[UILabel new]; targetInfo.text=[NSString stringWithFormat:@"Settings target (detected from this injected app): %@",gAppBundleID.length?gAppBundleID:@"unknown bundle ID"]; targetInfo.font=[UIFont monospacedDigitSystemFontOfSize:9 weight:UIFontWeightRegular]; targetInfo.textColor=[UIColor secondaryLabelColor]; targetInfo.numberOfLines=0; [_stack addArrangedSubview:targetInfo];
+    [_stack addArrangedSubview:[self usageOptionRowWithTitle:@"Hide app usage state" detail:@"When enabled, selected public state queries report active even after this app is backgrounded. iOS may still suspend it or deliver other signals." option:U_MASK]];
+    [_stack addArrangedSubview:[self usageOptionRowWithTitle:@"UIApplication reports Active" detail:@"Masks this process's applicationState getter; the overlay uses actual state internally." option:U_APP_STATE]];
+    [_stack addArrangedSubview:[self usageOptionRowWithTitle:@"Scenes report Foreground Active" detail:@"Masks UIScene activationState queries for scenes in this app." option:U_SCENE_STATE]];
+    [_stack addArrangedSubview:[self usageOptionRowWithTitle:@"Protected data reports available" detail:@"Masks the availability query only; it does not unlock files, the Keychain, or the device." option:U_PROTECTED_DATA]];
+    [_stack addArrangedSubview:[self usageOptionRowWithTitle:@"Screen brightness reports 100%" detail:@"Changes the brightness getter result, not the physical display or lock state." option:U_SCREEN_BRIGHTNESS]];
+    [_stack addArrangedSubview:[self usageOptionRowWithTitle:@"Suppress background notifications" detail:@"Suppresses selected public background/lock-related NotificationCenter broadcasts. Direct delegate callbacks and private APIs may still reveal state." option:U_LIFECYCLE_NOTIFICATIONS]];
     // Button controls
     [_stack addArrangedSubview:[self section:@"Floating button"]];
     UIView *btnRow1=[self rowForKey:@"btnOpacity" label:@"Opacity" min:0.3 max:1.0];
@@ -806,6 +887,7 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
 }
 - (void)masterToggle:(UISwitch*)s{ gAppEnabled=s.isOn; SBResetGPSFilter(); }
 - (void)gpsAdjustmentsToggle:(UISwitch*)s{ gGPSAdjustmentsEnabled=s.isOn; SBResetGPSFilter(); }
+- (void)usageMaskToggle:(UISwitch*)s{ if(s.tag>=0 && s.tag<U_COUNT) gUsageMaskOption[s.tag]=s.isOn; }
 - (void)saveTap{
     gBtnOpacity=((UISlider*)_sliders[@"btnOpacity"]).value; gBtnSize=((UISlider*)_sliders[@"btnSize"]).value;
     _floatBtn.alpha=gBtnOpacity; _floatBtn.backgroundColor=[UIColor systemBlueColor];
@@ -828,12 +910,16 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     }
     gAppEnabled=YES; _enabledSwitch.on=YES;
     gGPSAdjustmentsEnabled=NO; _gpsAdjustmentsSwitch.on=NO; SBResetGPSFilter();
+    gUsageMaskOption[U_MASK]=NO; gUsageMaskOption[U_APP_STATE]=YES; gUsageMaskOption[U_SCENE_STATE]=YES;
+    gUsageMaskOption[U_PROTECTED_DATA]=YES; gUsageMaskOption[U_SCREEN_BRIGHTNESS]=NO; gUsageMaskOption[U_LIFECYCLE_NOTIFICATIONS]=NO;
+    for(int i=0;i<U_COUNT;i++){ UISwitch *usageSwitch=(UISwitch*)_usageSwitches[[NSString stringWithFormat:@"%d",i]]; usageSwitch.on=gUsageMaskOption[i]; }
     savePrefs();
 }
 - (void)hideFloat{ _floatWindow.hidden=YES; _panelWindow.hidden=YES; }
 - (void)refreshUI{
     _enabledSwitch.on=gAppEnabled;
     _gpsAdjustmentsSwitch.on=gGPSAdjustmentsEnabled;
+    for(int i=0;i<U_COUNT;i++){ UISwitch *usageSwitch=(UISwitch*)_usageSwitches[[NSString stringWithFormat:@"%d",i]]; usageSwitch.on=gUsageMaskOption[i]; }
     for(NSString *k in _sliders.allKeys){
         double v=[self cur:k]; NSArray *keys=sensorKeys(); NSArray *ax=axisLetters();
         for(int si=0;si<S_COUNT;si++) for(int a=0;a<3;a++) if([[keys[si] stringByAppendingString:ax[a]] isEqualToString:k]) v=gAxis[si][a];
@@ -881,11 +967,48 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
 }
 @end
 
+static BOOL SBShouldSuppressLifecycleNotification(NSString *name){
+    if(!name.length || !SBUsageMaskIsActive() || !gUsageMaskOption[U_LIFECYCLE_NOTIFICATIONS]) return NO;
+    static NSSet *suppressedNames=nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken,^{
+        suppressedNames=[NSSet setWithArray:@[
+            UIApplicationWillResignActiveNotification,
+            UIApplicationDidEnterBackgroundNotification,
+            UIApplicationProtectedDataWillBecomeUnavailable,
+            UIScreenBrightnessDidChangeNotification,
+            UISceneWillDeactivateNotification,
+            UISceneDidEnterBackgroundNotification
+        ]];
+    });
+    return [suppressedNames containsObject:name];
+}
+static void SBScheduleOverlayActualStateCheck(void){
+    dispatch_async(dispatch_get_main_queue(),^{
+        if(SBActualApplicationState()==UIApplicationStateBackground) [[SBSensorBenderOverlay shared] reconcileVisibility];
+    });
+}
+
+%hook NSNotificationCenter
+- (void)postNotificationName:(NSNotificationName)name object:(id)object{
+    if(SBShouldSuppressLifecycleNotification(name)){ SBScheduleOverlayActualStateCheck(); return; }
+    %orig;
+}
+- (void)postNotificationName:(NSNotificationName)name object:(id)object userInfo:(NSDictionary*)userInfo{
+    if(SBShouldSuppressLifecycleNotification(name)){ SBScheduleOverlayActualStateCheck(); return; }
+    %orig;
+}
+- (void)postNotification:(NSNotification*)notification{
+    if(SBShouldSuppressLifecycleNotification(notification.name)){ SBScheduleOverlayActualStateCheck(); return; }
+    %orig;
+}
+%end
+
 %ctor{
     loadPrefs();
     SBInstallCLLocationSubclassHooks();
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n){ dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1.0*NSEC_PER_SEC)),dispatch_get_main_queue(),^{ [[SBSensorBenderOverlay shared] reconcileVisibility]; }); }];
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n){ [[SBSensorBenderOverlay shared] reconcileVisibility]; }];
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n){ [[SBSensorBenderOverlay shared] reconcileVisibility]; }];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1.5*NSEC_PER_SEC)),dispatch_get_main_queue(),^{ if([UIApplication sharedApplication].applicationState!=UIApplicationStateBackground) [[SBSensorBenderOverlay shared] reconcileVisibility]; });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1.5*NSEC_PER_SEC)),dispatch_get_main_queue(),^{ if(SBActualApplicationState()!=UIApplicationStateBackground) [[SBSensorBenderOverlay shared] reconcileVisibility]; });
 }
