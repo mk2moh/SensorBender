@@ -4,6 +4,8 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <math.h>
+#import <float.h>
+#import <stdlib.h>
 
 enum { S_ACCEL, S_GYRO, S_MAG, S_USERACCEL, S_GRAVITY, S_ROTRATE, S_MAGCAL, S_ATT, S_COUNT };
 enum { E_PRESSURE, E_RELALT, E_COUNT };
@@ -18,13 +20,15 @@ static double gBase[S_COUNT];
 static double gAxis[S_COUNT][3];
 static double mPressure = 1, mRelAlt = 1;
 static BOOL gGPSAdjustmentsEnabled = NO;
-static double gGPSSmoothing = 0.65;        // 0 = raw fixes; higher values smooth more.
-static double gGPSSpeedMultiplier = 1.0;   // Scales each filtered location step.
+static double gGPSSmoothing = 0.65;        // 0 = raw fixes; positive smooths, negative amplifies.
+static double gGPSSpeedMultiplier = 1.0;   // Scales each filtered location step; negative reverses.
 static double gBtnOpacity = 0.92, gBtnSize = 54;
 
 static NSArray *sensorKeys(){ return @[@"accel",@"gyro",@"mag",@"userAccel",@"gravity",@"rotRate",@"magCal",@"attitude"]; }
 static NSArray *sensorLabels(){ return @[@"Accelerometer",@"Gyroscope",@"Magnetometer",@"User Acceleration",@"Gravity",@"Rotation Rate",@"Calibrated Mag",@"Attitude"]; }
 static NSArray *axisLetters(){ return @[@"X",@"Y",@"Z"]; }
+static BOOL SBIsGPSControlKey(NSString *key){ return [key isEqualToString:@"gpsSmoothing"] || [key isEqualToString:@"gpsSpeed"]; }
+static NSString *SBFormatSettingValue(NSString *key, double value){ return SBIsGPSControlKey(key)?[NSString stringWithFormat:@"%.6g",value]:[NSString stringWithFormat:@"%.2f",value]; }
 
 static NSUserDefaults *prefsDB(){ return [NSUserDefaults standardUserDefaults]; }
 static double readD(id source, NSString *k, double def){ id v=[source objectForKey:k]; return v?[v doubleValue]:def; }
@@ -68,26 +72,42 @@ static double gGPSPreviousCourse = 0;
 static BOOL gGPSHasCourse = NO;
 static NSUInteger gGPSFilterGeneration = 0;
 static char gGPSAdjustmentAssociationKey;
+static NSUInteger gGPSCoordinateGetterCalls = 0;
+static NSUInteger gGPSAdjustedFixCount = 0;
+static BOOL gGPSHasLiveFix = NO;
+static CLLocationCoordinate2D gGPSLiveRawCoordinate = {0,0};
+static CLLocationCoordinate2D gGPSLiveAdjustedCoordinate = {0,0};
+static NSMutableDictionary *gSBOriginalCoordinateIMPs = nil;
+static CLLocationCoordinate2D SBSubclassCoordinateGetter(id self, SEL command);
+static void SBInstallCLLocationSubclassHooks(void);
 
 static void SBResetGPSFilter(void){
+    __atomic_store_n(&gGPSCoordinateGetterCalls, 0, __ATOMIC_RELAXED);
     @synchronized([CLLocation class]) {
         gGPSFilterInitialized = NO;
         gGPSHasFilteredVelocity = NO;
         gGPSHasCourse = NO;
         gGPSLastTimestamp = 0;
+        gGPSAdjustedFixCount = 0;
+        gGPSHasLiveFix = NO;
+        gGPSLiveRawCoordinate = CLLocationCoordinate2DMake(0,0);
+        gGPSLiveAdjustedCoordinate = CLLocationCoordinate2DMake(0,0);
         gGPSFilterGeneration++;
     }
 }
 
 static CLLocationCoordinate2D SBCoordinateByAddingMeters(CLLocationCoordinate2D origin, double east, double north){
     const double earthRadius = 6371000.0;
+    if (!CLLocationCoordinate2DIsValid(origin) || !isfinite(east) || !isfinite(north)) return origin;
     double latRadians = origin.latitude * M_PI / 180.0;
     double cosine = cos(latRadians);
     if (!isfinite(cosine) || fabs(cosine) < 1e-6) return origin;
     double latitude = origin.latitude + (north / earthRadius) * 180.0 / M_PI;
     double longitude = origin.longitude + (east / (earthRadius * cosine)) * 180.0 / M_PI;
-    while (longitude > 180.0) longitude -= 360.0;
-    while (longitude < -180.0) longitude += 360.0;
+    if (!isfinite(latitude) || !isfinite(longitude)) return origin;
+    longitude = fmod(longitude, 360.0);
+    if (longitude > 180.0) longitude -= 360.0;
+    if (longitude < -180.0) longitude += 360.0;
     CLLocationCoordinate2D result = CLLocationCoordinate2DMake(latitude, longitude);
     return CLLocationCoordinate2DIsValid(result) ? result : origin;
 }
@@ -100,6 +120,22 @@ static void SBMetersBetweenCoordinates(CLLocationCoordinate2D from, CLLocationCo
     double meanLatitude = (from.latitude + to.latitude) * 0.5 * M_PI / 180.0;
     *east = deltaLongitude * M_PI / 180.0 * earthRadius * cos(meanLatitude);
     *north = (to.latitude - from.latitude) * M_PI / 180.0 * earthRadius;
+}
+
+// Positive values increase filter memory; negative values apply a bounded
+// anti-smoothing gain, without clamping the stored/user-entered value.
+static double SBAlphaForSmoothing(double smoothing, NSTimeInterval dt){
+    if (!isfinite(smoothing) || !isfinite(dt) || dt <= 0.0) return 1.0;
+    if (smoothing == 0.0) return 1.0;
+    double magnitude = fabs(smoothing);
+    double timeConstant = 0.05 + 4.0 * magnitude;
+    double filteredAlpha = 1.0 - exp(-dt / timeConstant);
+    if (smoothing < 0.0) {
+        double antiStrength = 1.0 - exp(-magnitude);
+        double alpha = 1.0 + antiStrength * (1.0 - filteredAlpha);
+        return isfinite(alpha) ? alpha : 1.0;
+    }
+    return isfinite(filteredAlpha) ? filteredAlpha : 1.0;
 }
 
 static NSDictionary *SBGPSAdjustmentForLocation(CLLocation *location, CLLocationCoordinate2D rawCoordinate){
@@ -161,9 +197,7 @@ static NSDictionary *SBGPSAdjustmentForLocation(CLLocation *location, CLLocation
                     hasCourse = gGPSHasCourse;
                     adjustedCourse = gGPSPreviousCourse;
                 } else {
-                    double smoothing = fmax(0.0, fmin(0.95, gGPSSmoothing));
-                    double alpha = smoothing == 0.0 ? 1.0 : 1.0 - exp(-dt / (0.05 + 4.0 * smoothing));
-                    alpha = fmax(0.05, fmin(1.0, alpha));
+                    double alpha = SBAlphaForSmoothing(gGPSSmoothing, dt);
                     double rawEastVelocity = east / dt;
                     double rawNorthVelocity = north / dt;
                     double previousEastVelocity = gGPSHasFilteredVelocity ? gGPSFilteredEastVelocity : 0.0;
@@ -172,14 +206,22 @@ static NSDictionary *SBGPSAdjustmentForLocation(CLLocation *location, CLLocation
                     gGPSFilteredNorthVelocity = alpha * rawNorthVelocity + (1.0 - alpha) * previousNorthVelocity;
                     gGPSHasFilteredVelocity = YES;
 
-                    double speedScale = fmax(0.1, fmin(1.0, gGPSSpeedMultiplier));
+                    double speedScale = gGPSSpeedMultiplier;
                     double stepEast = gGPSFilteredEastVelocity * dt * speedScale;
                     double stepNorth = gGPSFilteredNorthVelocity * dt * speedScale;
+                    if (!isfinite(stepEast) || !isfinite(stepNorth)) {
+                        // Keep corrupt/overflowing arithmetic from producing invalid coordinates.
+                        gGPSFilteredEastVelocity = 0;
+                        gGPSFilteredNorthVelocity = 0;
+                        gGPSHasFilteredVelocity = NO;
+                        stepEast = 0;
+                        stepNorth = 0;
+                    }
                     adjusted = SBCoordinateByAddingMeters(gGPSSpoofCoordinate, stepEast, stepNorth);
                     double adjustedDistance = hypot(stepEast, stepNorth);
-                    adjustedSpeed = adjustedDistance / dt;
+                    adjustedSpeed = isfinite(adjustedDistance / dt) ? adjustedDistance / dt : 0.0;
                     hasSpeed = YES;
-                    if (adjustedDistance > 0.05) {
+                    if (adjustedDistance > 0.05 && isfinite(adjustedDistance)) {
                         adjustedCourse = atan2(stepEast, stepNorth) * 180.0 / M_PI;
                         if (adjustedCourse < 0) adjustedCourse += 360.0;
                         gGPSPreviousCourse = adjustedCourse;
@@ -205,9 +247,72 @@ static NSDictionary *SBGPSAdjustmentForLocation(CLLocation *location, CLLocation
             @"course": @(adjustedCourse),
             @"generation": @(gGPSFilterGeneration)
         };
+        gGPSLiveRawCoordinate = rawCoordinate;
+        gGPSLiveAdjustedCoordinate = adjusted;
+        gGPSAdjustedFixCount++;
+        gGPSHasLiveFix = YES;
         objc_setAssociatedObject(location, &gGPSAdjustmentAssociationKey, result, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         return result;
     }
+}
+
+static NSValue *SBClassPointerKey(Class cls){ return [NSValue valueWithPointer:(__bridge const void *)cls]; }
+static IMP SBOriginalCoordinateIMPForClass(Class cls){
+    @synchronized([CLLocation class]) {
+        for(Class current=cls; current && current!=[NSObject class]; current=class_getSuperclass(current)){
+            NSValue *value=gSBOriginalCoordinateIMPs[SBClassPointerKey(current)];
+            if(value){ IMP original=NULL; [value getValue:&original]; return original; }
+        }
+    }
+    return NULL;
+}
+static CLLocationCoordinate2D SBSubclassCoordinateGetter(id self, SEL command){
+    IMP original=SBOriginalCoordinateIMPForClass(object_getClass(self));
+    CLLocationCoordinate2D raw;
+    if(original) raw=((CLLocationCoordinate2D(*)(id,SEL))original)(self,command);
+    else {
+        IMP base=class_getMethodImplementation([CLLocation class],command);
+        raw=((CLLocationCoordinate2D(*)(id,SEL))base)(self,command);
+    }
+    __atomic_add_fetch(&gGPSCoordinateGetterCalls,1,__ATOMIC_RELAXED);
+    NSDictionary *adjusted=SBGPSAdjustmentForLocation((CLLocation*)self,raw);
+    if(!adjusted) return raw;
+    return CLLocationCoordinate2DMake([adjusted[@"latitude"] doubleValue],[adjusted[@"longitude"] doubleValue]);
+}
+static void SBInstallCLLocationSubclassHooks(void){
+    Class base=objc_getClass("CLLocation");
+    if(!base) return;
+    int capacity=objc_getClassList(NULL,0);
+    if(capacity<=0) return;
+    Class *classes=calloc((size_t)capacity,sizeof(Class));
+    if(!classes) return;
+    int count=objc_getClassList(classes,capacity);
+    @synchronized([CLLocation class]) {
+        if(!gSBOriginalCoordinateIMPs) gSBOriginalCoordinateIMPs=[NSMutableDictionary dictionary];
+        for(int i=0;i<count;i++){
+            Class cls=classes[i];
+            if(!cls || cls==base) continue;
+            Class parent=class_getSuperclass(cls);
+            while(parent && parent!=base) parent=class_getSuperclass(parent);
+            if(parent!=base) continue;
+            unsigned methodCount=0;
+            Method *methods=class_copyMethodList(cls,&methodCount);
+            for(unsigned j=0;j<methodCount;j++){
+                if(method_getName(methods[j])!=@selector(coordinate)) continue;
+                IMP original=method_getImplementation(methods[j]);
+                if(original==(IMP)SBSubclassCoordinateGetter) break;
+                gSBOriginalCoordinateIMPs[SBClassPointerKey(cls)]=[NSValue valueWithBytes:&original objCType:@encode(IMP)];
+                method_setImplementation(methods[j],(IMP)SBSubclassCoordinateGetter);
+                break;
+            }
+            free(methods);
+        }
+    }
+    free(classes);
+}
+static void SBRescanCLLocationSubclassesSoon(void){
+    const NSTimeInterval delays[]={0.25,1.0,3.0};
+    for(int i=0;i<3;i++) dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(delays[i]*NSEC_PER_SEC)),dispatch_get_main_queue(),^{ SBInstallCLLocationSubclassHooks(); });
 }
 
 static void loadPrefs(void){
@@ -231,8 +336,10 @@ static void loadPrefs(void){
     gExtraEnabled[E_RELALT]=readB(local,@"relAltEnabled",YES);
     mPressure=readD(local,@"pressure",1); mRelAlt=readD(local,@"relAlt",1);
     gGPSAdjustmentsEnabled=readB(local,@"gpsEnabled",NO);
-    gGPSSmoothing=fmax(0.0,fmin(0.95,readD(local,@"gpsSmoothing",0.65)));
-    gGPSSpeedMultiplier=fmax(0.1,fmin(1.0,readD(local,@"gpsSpeed",1.0)));
+    double storedSmoothing=readD(local,@"gpsSmoothing",0.65);
+    double storedSpeed=readD(local,@"gpsSpeed",1.0);
+    gGPSSmoothing=isfinite(storedSmoothing)?storedSmoothing:0.65;
+    gGPSSpeedMultiplier=isfinite(storedSpeed)?storedSpeed:1.0;
     gBtnOpacity=readD(local,@"btnOpacity",0.92); gBtnSize=readD(local,@"btnSize",54);
 }
 
@@ -312,6 +419,7 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
 %hook CLLocation
 - (CLLocationCoordinate2D)coordinate{
     CLLocationCoordinate2D raw=%orig;
+    __atomic_add_fetch(&gGPSCoordinateGetterCalls,1,__ATOMIC_RELAXED);
     NSDictionary *adjusted=SBGPSAdjustmentForLocation(self,raw);
     if(!adjusted) return raw;
     return CLLocationCoordinate2DMake([adjusted[@"latitude"] doubleValue],[adjusted[@"longitude"] doubleValue]);
@@ -323,7 +431,7 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     NSDictionary *adjusted=objc_getAssociatedObject(self,&gGPSAdjustmentAssociationKey);
     if(![adjusted isKindOfClass:[NSDictionary class]]) return raw;
     if([adjusted[@"hasSpeed"] boolValue]) return [adjusted[@"speed"] doubleValue];
-    return raw<0 ? raw : raw*fmax(0.1,fmin(1.0,gGPSSpeedMultiplier));
+    return raw;
 }
 - (CLLocationDirection)course{
     CLLocationDirection raw=%orig;
@@ -333,6 +441,14 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     if([adjusted isKindOfClass:[NSDictionary class]] && [adjusted[@"hasCourse"] boolValue]) return [adjusted[@"course"] doubleValue];
     return raw;
 }
+%end
+
+// Core Location may vend private CLLocation subclasses. Hook direct coordinate
+// overrides too, and rescan before common location-request entry points.
+%hook CLLocationManager
+- (void)startUpdatingLocation{ SBInstallCLLocationSubclassHooks(); SBRescanCLLocationSubclassesSoon(); %orig; }
+- (void)requestLocation{ SBInstallCLLocationSubclassHooks(); SBRescanCLLocationSubclassesSoon(); %orig; }
+- (void)startMonitoringSignificantLocationChanges{ SBInstallCLLocationSubclassHooks(); SBRescanCLLocationSubclassesSoon(); %orig; }
 %end
 
 %hook CMDeviceMotion
@@ -387,6 +503,7 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     UIWindow *_floatWindow; UIWindow *_panelWindow;
     SBPassThroughView *_rootView; SBPassThroughView *_panelRootView;
     UIButton *_floatBtn; UIView *_panelBG; UIView *_card; UIScrollView *_scroll; UIStackView *_stack;
+    UILabel *_gpsLiveLabel;
     NSMutableDictionary *_sliders; NSMutableDictionary *_valueLabels; NSMutableDictionary *_liveLabels;
     NSMutableDictionary *_sensorHeaders; NSMutableDictionary *_absRows; NSMutableDictionary *_advContainers;
     UISwitch *_enabledSwitch; UISwitch *_gpsAdjustmentsSwitch;
@@ -523,8 +640,8 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
 - (UIView*)rowForKey:(NSString*)key label:(NSString*)lab min:(float)mn max:(float)mx{
     UIView *row=[UIView new];
     UILabel *ttl=[UILabel new]; ttl.text=lab; ttl.font=[UIFont systemFontOfSize:13 weight:UIFontWeightMedium]; ttl.translatesAutoresizingMaskIntoConstraints=NO; [ttl.widthAnchor constraintEqualToConstant:118].active=YES;
-    UISlider *sl=[UISlider new]; sl.minimumValue=mn; sl.maximumValue=mx; sl.value=[self cur:key]; sl.accessibilityIdentifier=key; [sl addTarget:self action:@selector(changed:) forControlEvents:UIControlEventValueChanged];
-    UILabel *val=[UILabel new]; val.font=[UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightMedium]; val.textColor=[UIColor systemBlueColor]; val.text=[NSString stringWithFormat:@"%.2f",sl.value]; val.translatesAutoresizingMaskIntoConstraints=NO; [val.widthAnchor constraintEqualToConstant:52].active=YES; val.textAlignment=NSTextAlignmentRight; val.userInteractionEnabled=YES; UITapGestureRecognizer *tap=[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tapValue:)]; [val addGestureRecognizer:tap]; val.accessibilityIdentifier=key;
+    UISlider *sl=[UISlider new]; sl.minimumValue=mn; sl.maximumValue=mx; double initialValue=[self cur:key]; sl.value=isfinite(initialValue)&&fabs(initialValue)<=FLT_MAX?(float)initialValue:(initialValue<0?mn:mx); sl.accessibilityIdentifier=key; [sl addTarget:self action:@selector(changed:) forControlEvents:UIControlEventValueChanged];
+    UILabel *val=[UILabel new]; val.font=[UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightMedium]; val.textColor=[UIColor systemBlueColor]; val.text=SBFormatSettingValue(key,initialValue); val.translatesAutoresizingMaskIntoConstraints=NO; [val.widthAnchor constraintEqualToConstant:SBIsGPSControlKey(key)?88:52].active=YES; val.textAlignment=NSTextAlignmentRight; val.userInteractionEnabled=YES; UITapGestureRecognizer *tap=[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tapValue:)]; [val addGestureRecognizer:tap]; val.accessibilityIdentifier=key;
     _sliders[key]=sl; _valueLabels[key]=val;
     UIStackView *h=[[UIStackView alloc] initWithArrangedSubviews:@[ttl,sl,val]]; h.axis=UILayoutConstraintAxisHorizontal; h.spacing=8; h.alignment=UIStackViewAlignmentCenter; h.translatesAutoresizingMaskIntoConstraints=NO;
     [row addSubview:h]; [NSLayoutConstraint activateConstraints:@[[h.topAnchor constraintEqualToAnchor:row.topAnchor],[h.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],[h.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],[h.bottomAnchor constraintEqualToAnchor:row.bottomAnchor]]];
@@ -546,41 +663,46 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     [NSLayoutConstraint activateConstraints:@[[h.topAnchor constraintEqualToAnchor:row.topAnchor],[h.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],[h.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],[h.bottomAnchor constraintEqualToAnchor:row.bottomAnchor]]];
     return row;
 }
-- (float)cur:(NSString*)k{
+- (double)cur:(NSString*)k{
     if([k isEqualToString:@"accel"]) return gBase[S_ACCEL]; if([k isEqualToString:@"gyro"]) return gBase[S_GYRO]; if([k isEqualToString:@"mag"]) return gBase[S_MAG];
     if([k isEqualToString:@"userAccel"]) return gBase[S_USERACCEL]; if([k isEqualToString:@"gravity"]) return gBase[S_GRAVITY]; if([k isEqualToString:@"rotRate"]) return gBase[S_ROTRATE];
     if([k isEqualToString:@"magCal"]) return gBase[S_MAGCAL]; if([k isEqualToString:@"attitude"]) return gBase[S_ATT];
-    if([k isEqualToString:@"pressure"]) return (float)mPressure; if([k isEqualToString:@"relAlt"]) return (float)mRelAlt;
-    if([k isEqualToString:@"gpsSmoothing"]) return (float)gGPSSmoothing; if([k isEqualToString:@"gpsSpeed"]) return (float)gGPSSpeedMultiplier;
-    NSArray *keys=sensorKeys(); NSArray *ax=axisLetters(); for(int s=0;s<S_COUNT;s++) for(int a=0;a<3;a++) if([[keys[s] stringByAppendingString:ax[a]] isEqualToString:k]) return (float)gAxis[s][a];
+    if([k isEqualToString:@"pressure"]) return mPressure; if([k isEqualToString:@"relAlt"]) return mRelAlt;
+    if([k isEqualToString:@"gpsSmoothing"]) return gGPSSmoothing; if([k isEqualToString:@"gpsSpeed"]) return gGPSSpeedMultiplier;
+    NSArray *keys=sensorKeys(); NSArray *ax=axisLetters(); for(int s=0;s<S_COUNT;s++) for(int a=0;a<3;a++) if([[keys[s] stringByAppendingString:ax[a]] isEqualToString:k]) return gAxis[s][a];
     return 1;
 }
-- (void)setCur:(float)v key:(NSString*)k{
+- (void)setCur:(double)v key:(NSString*)k{
     if([k isEqualToString:@"accel"]) gBase[S_ACCEL]=v; else if([k isEqualToString:@"gyro"]) gBase[S_GYRO]=v; else if([k isEqualToString:@"mag"]) gBase[S_MAG]=v;
     else if([k isEqualToString:@"userAccel"]) gBase[S_USERACCEL]=v; else if([k isEqualToString:@"gravity"]) gBase[S_GRAVITY]=v; else if([k isEqualToString:@"rotRate"]) gBase[S_ROTRATE]=v;
     else if([k isEqualToString:@"magCal"]) gBase[S_MAGCAL]=v; else if([k isEqualToString:@"attitude"]) gBase[S_ATT]=v;
     else if([k isEqualToString:@"pressure"]) mPressure=v; else if([k isEqualToString:@"relAlt"]) mRelAlt=v;
-    else if([k isEqualToString:@"gpsSmoothing"]) gGPSSmoothing=fmax(0.0,fmin(0.95,v));
-    else if([k isEqualToString:@"gpsSpeed"]) gGPSSpeedMultiplier=fmax(0.1,fmin(1.0,v));
+    else if([k isEqualToString:@"gpsSmoothing"]) gGPSSmoothing=v;
+    else if([k isEqualToString:@"gpsSpeed"]) gGPSSpeedMultiplier=v;
 }
-- (void)changed:(UISlider*)s{ NSString *k=s.accessibilityIdentifier; ((UILabel*)_valueLabels[k]).text=[NSString stringWithFormat:@"%.2f",s.value]; [self setCur:s.value key:k]; }
+- (void)expandSliderForKey:(NSString*)key value:(double)value{
+    UISlider *slider=_sliders[key];
+    if(!slider || !isfinite(value) || fabs(value)>FLT_MAX) return;
+    float sliderValue=(float)value;
+    BOOL isGPSControl=SBIsGPSControlKey(key);
+    if(sliderValue<slider.minimumValue) slider.minimumValue=isGPSControl?sliderValue:sliderValue-1.0f;
+    if(sliderValue>slider.maximumValue) slider.maximumValue=isGPSControl?sliderValue:sliderValue+1.0f;
+}
+- (void)changed:(UISlider*)s{ NSString *k=s.accessibilityIdentifier; ((UILabel*)_valueLabels[k]).text=SBFormatSettingValue(k,s.value); [self setCur:s.value key:k]; }
 - (void)axisChanged:(UISlider*)s{ NSString *k=s.accessibilityIdentifier; ((UILabel*)_valueLabels[k]).text=[NSString stringWithFormat:@"%.2f",s.value]; NSArray *keys=sensorKeys(); NSArray *ax=axisLetters(); for(int si=0;si<S_COUNT;si++) for(int a=0;a<3;a++) if([[keys[si] stringByAppendingString:ax[a]] isEqualToString:k]){ gAxis[si][a]=s.value; return; } }
 - (void)tapValue:(UITapGestureRecognizer*)t{
     UILabel *lbl=(UILabel*)t.view; NSString *key=lbl.accessibilityIdentifier;
-    UIAlertController *alert=[UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"Set %@",key] message:@"Enter a multiplier or filter value. GPS controls are clamped to their slider ranges." preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertController *alert=[UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"Set %@",key] message:@"GPS values accept any finite number, including values outside the slider range. Other sensor entries retain their existing range." preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *tf){ tf.keyboardType=UIKeyboardTypeNumbersAndPunctuation; tf.placeholder=lbl.text; tf.text=lbl.text; }];
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Set" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
         NSString *txt=alert.textFields.firstObject.text; double v=[txt doubleValue];
-        UISlider *sl=self->_sliders[key]; if(!sl) return;
-        if([key isEqualToString:@"gpsSmoothing"]) v=fmax(0.0,fmin(0.95,v));
-        else if([key isEqualToString:@"gpsSpeed"]) v=fmax(0.1,fmin(1.0,v));
-        else { if(v<-1000) v=-1000; if(v>1000) v=1000; }
-        if(![key isEqualToString:@"gpsSmoothing"] && ![key isEqualToString:@"gpsSpeed"]){
-            if(sl.minimumValue>v) sl.minimumValue=v-1;
-            if(sl.maximumValue<v) sl.maximumValue=v+1;
-        }
-        sl.value=v; ((UILabel*)self->_valueLabels[key]).text=[NSString stringWithFormat:@"%.2f",v];
+        UISlider *sl=self->_sliders[key]; if(!sl || !isfinite(v)) return;
+        BOOL isGPSControl=SBIsGPSControlKey(key);
+        if(!isGPSControl){ if(v<-1000) v=-1000; if(v>1000) v=1000; }
+        [self expandSliderForKey:key value:v];
+        if(fabs(v)<=FLT_MAX) sl.value=(float)v;
+        ((UILabel*)self->_valueLabels[key]).text=SBFormatSettingValue(key,v);
         if([key length]>1 && ([sensorKeys() containsObject:[key substringToIndex:key.length-1]] || [key hasSuffix:@"X"]||[key hasSuffix:@"Y"]||[key hasSuffix:@"Z"])){
             NSArray *keys=sensorKeys(); NSArray *ax=axisLetters(); for(int si=0;si<S_COUNT;si++) for(int p=0;p<3;p++) if([[keys[si] stringByAppendingString:ax[p]] isEqualToString:key]){ gAxis[si][p]=v; return; }
         }
@@ -664,7 +786,8 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     [_stack addArrangedSubview:gpsEnabledRow];
     [_stack addArrangedSubview:[self rowForKey:@"gpsSmoothing" label:@"Jitter smoothing" min:0 max:0.95]];
     [_stack addArrangedSubview:[self rowForKey:@"gpsSpeed" label:@"GPS speed scale" min:0.1 max:1.0]];
-    UILabel *gpsHint=[UILabel new]; gpsHint.text=@"Higher smoothing reduces fix-to-fix bounce. Speed scale slows the reported path, so it can trail the real fixes; it is separate from the accelerometer multiplier."; gpsHint.font=[UIFont systemFontOfSize:10]; gpsHint.textColor=[UIColor secondaryLabelColor]; gpsHint.numberOfLines=0; [_stack addArrangedSubview:gpsHint];
+    UILabel *gpsHint=[UILabel new]; gpsHint.text=@"Positive smoothing increases filtering; negative values amplify changes. Speed scale multiplies the adjusted path: 0 pauses it, negative values reverse it, and values above 1 speed it up. This is separate from acceleration scaling."; gpsHint.font=[UIFont systemFontOfSize:10]; gpsHint.textColor=[UIColor secondaryLabelColor]; gpsHint.numberOfLines=0; [_stack addArrangedSubview:gpsHint];
+    _gpsLiveLabel=[UILabel new]; _gpsLiveLabel.font=[UIFont monospacedDigitSystemFontOfSize:9 weight:UIFontWeightRegular]; _gpsLiveLabel.textColor=[UIColor secondaryLabelColor]; _gpsLiveLabel.numberOfLines=0; _gpsLiveLabel.text=@"GPS check: waiting for Core Location reads"; [_stack addArrangedSubview:_gpsLiveLabel];
     // Button controls
     [_stack addArrangedSubview:[self section:@"Floating button"]];
     UIView *btnRow1=[self rowForKey:@"btnOpacity" label:@"Opacity" min:0.3 max:1.0];
@@ -687,6 +810,7 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     gBtnOpacity=((UISlider*)_sliders[@"btnOpacity"]).value; gBtnSize=((UISlider*)_sliders[@"btnSize"]).value;
     _floatBtn.alpha=gBtnOpacity; _floatBtn.backgroundColor=[UIColor systemBlueColor];
     CGRect f=_floatBtn.frame; f.size=CGSizeMake(gBtnSize,gBtnSize); _floatBtn.layer.cornerRadius=gBtnSize/2; _floatBtn.frame=f;
+    SBResetGPSFilter();
     savePrefs();
     UIImpactFeedbackGenerator *g=[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium]; [g impactOccurred]; [self togglePanel];
 }
@@ -694,7 +818,10 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     for(NSString *k in _sliders.allKeys){
         if([k isEqualToString:@"btnOpacity"]||[k isEqualToString:@"btnSize"]) continue;
         float resetValue=[k isEqualToString:@"gpsSmoothing"]?0.65f:1.0f;
-        UISlider *sl=(UISlider*)_sliders[k]; sl.value=resetValue; ((UILabel*)_valueLabels[k]).text=[NSString stringWithFormat:@"%.2f",resetValue];
+        UISlider *sl=(UISlider*)_sliders[k];
+        if([k isEqualToString:@"gpsSmoothing"]){ sl.minimumValue=0.0; sl.maximumValue=0.95; }
+        else if([k isEqualToString:@"gpsSpeed"]){ sl.minimumValue=0.1; sl.maximumValue=1.0; }
+        sl.value=resetValue; ((UILabel*)_valueLabels[k]).text=[NSString stringWithFormat:@"%.2f",resetValue];
         NSArray *keys=sensorKeys(); NSArray *ax=axisLetters(); BOOL isAxis=NO;
         for(int si=0;si<S_COUNT;si++) for(int a=0;a<3;a++) if([[keys[si] stringByAppendingString:ax[a]] isEqualToString:k]){ gAxis[si][a]=1; isAxis=YES; }
         if(!isAxis) [self setCur:resetValue key:k];
@@ -708,10 +835,12 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     _enabledSwitch.on=gAppEnabled;
     _gpsAdjustmentsSwitch.on=gGPSAdjustmentsEnabled;
     for(NSString *k in _sliders.allKeys){
-        float v=[self cur:k]; NSArray *keys=sensorKeys(); NSArray *ax=axisLetters();
-        for(int si=0;si<S_COUNT;si++) for(int a=0;a<3;a++) if([[keys[si] stringByAppendingString:ax[a]] isEqualToString:k]) v=(float)gAxis[si][a];
+        double v=[self cur:k]; NSArray *keys=sensorKeys(); NSArray *ax=axisLetters();
+        for(int si=0;si<S_COUNT;si++) for(int a=0;a<3;a++) if([[keys[si] stringByAppendingString:ax[a]] isEqualToString:k]) v=gAxis[si][a];
         if([k isEqualToString:@"btnOpacity"]) v=gBtnOpacity; if([k isEqualToString:@"btnSize"]) v=gBtnSize;
-        UISlider *sl=(UISlider*)_sliders[k]; sl.value=v; ((UILabel*)_valueLabels[k]).text=[NSString stringWithFormat:@"%.2f",v];
+        UISlider *sl=(UISlider*)_sliders[k];
+        if(isfinite(v)){ if(fabs(v)<=FLT_MAX){ [self expandSliderForKey:k value:v]; sl.value=(float)v; } else sl.value=v<0?sl.minimumValue:sl.maximumValue; }
+        ((UILabel*)_valueLabels[k]).text=SBFormatSettingValue(k,v);
     }
     // update per-sensor header hints
     for(int i=0;i<S_COUNT;i++){ NSString *k=sensorKeys()[i]; UIView *hdr=_sensorHeaders[k]; if(!hdr) continue;
@@ -734,12 +863,27 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
         else txt=[NSString stringWithFormat:@"live: updating…"];
         live.text=txt;
     }
-    // extra live not implemented
+    if(_gpsLiveLabel){
+        NSUInteger reads=__atomic_load_n(&gGPSCoordinateGetterCalls,__ATOMIC_RELAXED);
+        NSUInteger fixes=0; BOOL hasFix=NO; CLLocationCoordinate2D raw={0,0}, adjusted={0,0};
+        @synchronized([CLLocation class]){
+            fixes=gGPSAdjustedFixCount; hasFix=gGPSHasLiveFix;
+            raw=gGPSLiveRawCoordinate; adjusted=gGPSLiveAdjustedCoordinate;
+        }
+        if(!gGPSAdjustmentsEnabled) _gpsLiveLabel.text=[NSString stringWithFormat:@"GPS check: adjustments off · Core Location reads: %lu",(unsigned long)reads];
+        else if(reads==0) _gpsLiveLabel.text=@"GPS check: no hooked CLLocation coordinate reads yet";
+        else if(!hasFix) _gpsLiveLabel.text=[NSString stringWithFormat:@"GPS check: %lu coordinate reads, but no usable adjusted fix yet",(unsigned long)reads];
+        else {
+            double east=0,north=0; SBMetersBetweenCoordinates(raw,adjusted,&east,&north);
+            _gpsLiveLabel.text=[NSString stringWithFormat:@"GPS check: %lu reads · %lu adjusted fixes\nRaw: %.6f, %.6f\nOutput: %.6f, %.6f · Δ %.1f m",(unsigned long)reads,(unsigned long)fixes,raw.latitude,raw.longitude,adjusted.latitude,adjusted.longitude,hypot(east,north)];
+        }
+    }
 }
 @end
 
 %ctor{
     loadPrefs();
+    SBInstallCLLocationSubclassHooks();
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n){ dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1.0*NSEC_PER_SEC)),dispatch_get_main_queue(),^{ [[SBSensorBenderOverlay shared] reconcileVisibility]; }); }];
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n){ [[SBSensorBenderOverlay shared] reconcileVisibility]; }];
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n){ [[SBSensorBenderOverlay shared] reconcileVisibility]; }];
