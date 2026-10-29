@@ -1,4 +1,4 @@
-name: Build MotionSpoofer standalone dylib
+name: Build SensorBender standalone dylib
 on: [push, workflow_dispatch]
 
 jobs:
@@ -11,7 +11,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/theos
-          key: theos-roothide-macos14-v3
+          key: theos-roothide-macos14-v4
 
       - name: Cache SDKs
         uses: actions/cache@v4
@@ -26,7 +26,7 @@ jobs:
         run: |
           VERSION="$(tr -d '[:space:]' < VERSION)"
           test -n "$VERSION"
-          echo "MOTION_SPOOFER_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "SENSOR_BENDER_VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Setup Roothide Theos
         run: |
@@ -40,10 +40,10 @@ jobs:
         run: |
           gmake clean
           gmake all FINALPACKAGE=1
-          DYLIB_PATH="$(find .theos/obj -type f -name 'MotionSpoofer.dylib' -print -quit)"
+          DYLIB_PATH="$(find .theos/obj -type f -name 'SensorBender.dylib' -print -quit)"
           test -n "$DYLIB_PATH"
           mkdir -p release
-          DYLIB="release/MotionSpoofer-v${MOTION_SPOOFER_VERSION}.dylib"
+          DYLIB="release/SensorBender-v${SENSOR_BENDER_VERSION}.dylib"
           cp "$DYLIB_PATH" "$DYLIB"
           otool -L "$DYLIB" | tee release/dylib-load-commands.txt
           # otool -L includes the dylib's own LC_ID_DYLIB after the file header;
@@ -58,22 +58,22 @@ jobs:
       - name: Assemble versioned ZIP
         run: |
           cat > release/README.txt <<EOF
-          MotionSpoofer v${MOTION_SPOOFER_VERSION} — standalone TrollFools dylib
+          SensorBender v${SENSOR_BENDER_VERSION} — standalone TrollFools dylib
 
-          MotionSpoofer-v${MOTION_SPOOFER_VERSION}.dylib
+          SensorBender-v${SENSOR_BENDER_VERSION}.dylib
             Inject into an app you own or are authorized to test. The in-app
             panel includes CoreMotion multipliers and optional GPS smoothing
             and speed scaling. Steps/Distance/HealthKit hooks are not included.
           EOF
-          (cd release && zip -q -j "../MotionSpoofer-v${MOTION_SPOOFER_VERSION}.zip" \
-            "MotionSpoofer-v${MOTION_SPOOFER_VERSION}.dylib" README.txt)
-          unzip -l "MotionSpoofer-v${MOTION_SPOOFER_VERSION}.zip"
+          (cd release && zip -q -j "../SensorBender-v${SENSOR_BENDER_VERSION}.zip" \
+            "SensorBender-v${SENSOR_BENDER_VERSION}.dylib" README.txt)
+          unzip -l "SensorBender-v${SENSOR_BENDER_VERSION}.zip"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: MotionSpoofer-v${{ env.MOTION_SPOOFER_VERSION }}
+          name: SensorBender-v${{ env.SENSOR_BENDER_VERSION }}
           path: |
-            MotionSpoofer-v${{ env.MOTION_SPOOFER_VERSION }}.zip
-            release/MotionSpoofer-v${{ env.MOTION_SPOOFER_VERSION }}.dylib
+            SensorBender-v${{ env.SENSOR_BENDER_VERSION }}.zip
+            release/SensorBender-v${{ env.SENSOR_BENDER_VERSION }}.dylib
           if-no-files-found: error
           retention-days: 30
