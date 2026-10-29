@@ -1,0 +1,79 @@
+name: Build MotionSpoofer standalone dylib
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Theos
+        uses: actions/cache@v4
+        with:
+          path: ~/theos
+          key: theos-roothide-macos14-v3
+
+      - name: Cache SDKs
+        uses: actions/cache@v4
+        with:
+          path: ~/sdks
+          key: sdks-macos14-v1
+
+      - name: Install tools
+        run: brew install ldid make xz zip || brew upgrade ldid || true
+
+      - name: Set version
+        run: |
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          test -n "$VERSION"
+          echo "MOTION_SPOOFER_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Setup Roothide Theos
+        run: |
+          if [ ! -d "$HOME/theos" ]; then git clone --recursive https://github.com/roothide/theos "$HOME/theos"; fi
+          if [ ! -d "$HOME/sdks" ]; then git clone --depth 1 https://github.com/theos/sdks "$HOME/sdks"; fi
+          mkdir -p "$HOME/theos/sdks"
+          cp -Rn "$HOME/sdks/"*.sdk "$HOME/theos/sdks/" 2>/dev/null || true
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+      - name: Build standalone dylib
+        run: |
+          gmake clean
+          gmake all FINALPACKAGE=1
+          DYLIB_PATH="$(find .theos/obj -type f -name 'MotionSpoofer.dylib' -print -quit)"
+          test -n "$DYLIB_PATH"
+          mkdir -p release
+          DYLIB="release/MotionSpoofer-v${MOTION_SPOOFER_VERSION}.dylib"
+          cp "$DYLIB_PATH" "$DYLIB"
+          otool -L "$DYLIB" | tee release/dylib-load-commands.txt
+          # otool -L includes the dylib's own LC_ID_DYLIB after the file header;
+          # scan only actual linked libraries for hook-runtime dependencies.
+          otool -L "$DYLIB" | sed '1,2d' | tee release/dylib-dependencies.txt
+          test -s release/dylib-dependencies.txt
+          if grep -Eiq 'substrate|substitute|libhooker' release/dylib-dependencies.txt; then
+            echo "Standalone dylib unexpectedly links to a tweak-hook runtime." >&2
+            exit 1
+          fi
+
+      - name: Assemble versioned ZIP
+        run: |
+          cat > release/README.txt <<EOF
+          MotionSpoofer v${MOTION_SPOOFER_VERSION} — standalone TrollFools dylib
+
+          MotionSpoofer-v${MOTION_SPOOFER_VERSION}.dylib
+            Inject into an app you own or are authorized to test. The in-app
+            panel includes CoreMotion multipliers and optional GPS smoothing
+            and speed scaling. Steps/Distance/HealthKit hooks are not included.
+          EOF
+          (cd release && zip -q -j "../MotionSpoofer-v${MOTION_SPOOFER_VERSION}.zip" \
+            "MotionSpoofer-v${MOTION_SPOOFER_VERSION}.dylib" README.txt)
+          unzip -l "MotionSpoofer-v${MOTION_SPOOFER_VERSION}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MotionSpoofer-v${{ env.MOTION_SPOOFER_VERSION }}
+          path: |
+            MotionSpoofer-v${{ env.MOTION_SPOOFER_VERSION }}.zip
+            release/MotionSpoofer-v${{ env.MOTION_SPOOFER_VERSION }}.dylib
+          if-no-files-found: error
+          retention-days: 30
