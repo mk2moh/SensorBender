@@ -16,6 +16,7 @@ static BOOL gExtraEnabled[E_COUNT];
 static BOOL gAppEnabled = YES;
 static BOOL gUsageMaskOption[U_COUNT];
 static __thread BOOL gSBReadActualLifecycleState = NO;
+static __thread BOOL gSBReadRawGPSAccuracy = NO;
 static NSString *gAppBundleID = nil;
 static BOOL gSensorEnabled[S_COUNT];
 static BOOL gSensorAdv[S_COUNT];
@@ -23,14 +24,30 @@ static double gBase[S_COUNT];
 static double gAxis[S_COUNT][3];
 static double mPressure = 1, mRelAlt = 1;
 static BOOL gGPSAdjustmentsEnabled = NO;
-static double gGPSSmoothing = 0.65;        // 0 = raw fixes; positive smooths, negative amplifies.
-static double gGPSSpeedMultiplier = 1.0;   // Scales each filtered location step; negative reverses.
+static double gGPSSmoothing = 0.65;        // 0 = raw path; positive values add response lag, negative values amplify changes.
+static double gGPSSpeedMultiplier = 1.0;   // Moving distance scale: 1 = full step, 0 = hold, negative reverses.
+static double gGPSDeadbandMeters = 10.0;
+static double gGPSStationaryDriftMetersPerMinute = 0.0;
+static double gGPSMoveConfirmSeconds = 3.0;
+static double gGPSStationarySpeedThreshold = 0.8;
+static double gGPSMaxStepMeters = 10.0;
+static double gGPSMinUpdateIntervalSeconds = 0.0;
+static BOOL gGPSAccuracyFilterEnabled = YES;
+static double gGPSMaxHorizontalAccuracy = 50.0;
+static double gGPSAltitudeScale = 1.0, gGPSAltitudeOffsetMeters = 0.0;
+static double gGPSHorizontalAccuracyScale = 1.0, gGPSVerticalAccuracyScale = 1.0;
+static double gGPSReportedSpeedScale = 1.0, gGPSCourseOffsetDegrees = 0.0;
+static double gGPSOffsetEastMeters = 0.0, gGPSOffsetNorthMeters = 0.0;
 static double gBtnOpacity = 0.92, gBtnSize = 54;
 
 static NSArray *sensorKeys(){ return @[@"accel",@"gyro",@"mag",@"userAccel",@"gravity",@"rotRate",@"magCal",@"attitude"]; }
 static NSArray *sensorLabels(){ return @[@"Accelerometer",@"Gyroscope",@"Magnetometer",@"User Acceleration",@"Gravity",@"Rotation Rate",@"Calibrated Mag",@"Attitude"]; }
 static NSArray *axisLetters(){ return @[@"X",@"Y",@"Z"]; }
-static BOOL SBIsGPSControlKey(NSString *key){ return [key isEqualToString:@"gpsSmoothing"] || [key isEqualToString:@"gpsSpeed"]; }
+static BOOL SBIsGPSControlKey(NSString *key){
+    static NSSet *keys=nil; static dispatch_once_t onceToken;
+    dispatch_once(&onceToken,^{ keys=[NSSet setWithArray:@[@"gpsSmoothing",@"gpsSpeed",@"gpsDeadband",@"gpsStationaryDrift",@"gpsMoveConfirm",@"gpsStationarySpeed",@"gpsMaxStep",@"gpsMinInterval",@"gpsMaxAccuracy",@"gpsAltitudeScale",@"gpsAltitudeOffset",@"gpsHorizontalAccuracyScale",@"gpsVerticalAccuracyScale",@"gpsReportedSpeedScale",@"gpsCourseOffset",@"gpsOffsetEast",@"gpsOffsetNorth"]]; });
+    return [keys containsObject:key];
+}
 static NSString *SBFormatSettingValue(NSString *key, double value){ return SBIsGPSControlKey(key)?[NSString stringWithFormat:@"%.6g",value]:[NSString stringWithFormat:@"%.2f",value]; }
 
 static NSUserDefaults *prefsDB(){ return [NSUserDefaults standardUserDefaults]; }
@@ -51,6 +68,58 @@ static UISceneActivationState SBActualSceneActivationState(UIScene *scene){
     UISceneActivationState state=scene.activationState;
     gSBReadActualLifecycleState=previous;
     return state;
+}
+static NSArray *SBAllAppWindows(void){
+    UIApplication *application=[UIApplication sharedApplication];
+    NSMutableArray *windows=[NSMutableArray array];
+    for(UIScene *scene in application.connectedScenes){
+        if([scene isKindOfClass:[UIWindowScene class]]) [windows addObjectsFromArray:((UIWindowScene*)scene).windows];
+    }
+    if(windows.count==0) [windows addObjectsFromArray:application.windows];
+    return windows;
+}
+static CGRect SBPreferredFloatFrame(UIWindowScene *scene,CGFloat size,UIWindow *ownWindow){
+    CGRect bounds=scene?scene.coordinateSpace.bounds:[UIScreen mainScreen].bounds;
+    if(bounds.size.width<=0||bounds.size.height<=0) bounds=[UIScreen mainScreen].bounds;
+    CGFloat margin=12.0, step=size+14.0, startY=MAX(82.0,size*0.5+12.0);
+    NSInteger rows=MAX(1,(NSInteger)((bounds.size.height-startY-margin)/(step)));
+    NSArray *windows=SBAllAppWindows();
+    for(NSInteger row=0;row<rows;row++){
+        CGFloat y=startY+size*0.5+row*step;
+        if(y>bounds.size.height-margin-size*0.5) break;
+        for(int column=0;column<2;column++){
+            CGFloat x=column==0?margin+size*0.5:bounds.size.width-margin-size*0.5;
+            CGRect candidate=CGRectMake(x-size*0.5,y-size*0.5,size,size);
+            BOOL collision=NO;
+            for(UIWindow *window in windows){
+                if(window==ownWindow||window.hidden||window.alpha<0.01) continue;
+                if(scene&&window.windowScene&&window.windowScene!=scene) continue;
+                CGRect other=window.frame;
+                if(other.size.width>MAX(size*3.0,180.0)||other.size.height>MAX(size*3.0,180.0)) continue;
+                if(CGRectIntersectsRect(CGRectInset(candidate,-8.0,-8.0),other)){ collision=YES; break; }
+            }
+            if(!collision) return candidate;
+        }
+    }
+    return CGRectMake(MAX(margin,bounds.size.width-margin-size),startY,size,size);
+}
+static UIWindowLevel SBNextOverlayWindowLevel(UIWindow *floatWindow,UIWindow *panelWindow){
+    UIWindowLevel level=UIWindowLevelAlert+2.0;
+    for(UIWindow *window in SBAllAppWindows()){
+        if(window==floatWindow||window==panelWindow||window.hidden) continue;
+        level=MAX(level,window.windowLevel+1.0);
+    }
+    return level;
+}
+static BOOL SBHasVisibleCompetingPanel(UIWindow *ownPanel){
+    CGRect bounds=[UIScreen mainScreen].bounds;
+    for(UIWindow *window in SBAllAppWindows()){
+        if(window==ownPanel||window.hidden||window.alpha<0.01||window.windowLevel<UIWindowLevelAlert) continue;
+        if(ownPanel.windowScene&&window.windowScene&&window.windowScene!=ownPanel.windowScene) continue;
+        CGRect frame=window.frame;
+        if(frame.size.width>bounds.size.width*0.75 && frame.size.height>bounds.size.height*0.75) return YES;
+    }
+    return NO;
 }
 
 // Best-effort per-process masking of public app/screen state queries.
@@ -105,9 +174,8 @@ static double SBSpoofCompassHeading(CLHeading *heading, double originalHeading){
     return result;
 }
 
-// Stateful, per-process GPS filter. It smooths the movement between consecutive
-// fixes, scales the resulting trajectory, and keeps speed/course consistent with
-// the coordinates that the injected app reads.
+// Stateful GPS path processor. Stationary detection, distance caps, update cadence,
+// smoothing, and the optional Core Location field overrides are independently tunable.
 static BOOL gGPSFilterInitialized = NO;
 static CLLocationCoordinate2D gGPSLastRawCoordinate = {0,0};
 static CLLocationCoordinate2D gGPSSpoofCoordinate = {0,0};
@@ -117,10 +185,19 @@ static double gGPSFilteredEastVelocity = 0, gGPSFilteredNorthVelocity = 0;
 static BOOL gGPSHasFilteredVelocity = NO;
 static double gGPSPreviousCourse = 0;
 static BOOL gGPSHasCourse = NO;
+static BOOL gGPSIsStationary = YES;
+static CLLocationCoordinate2D gGPSStationaryAnchorRaw = {0,0};
+static CLLocationCoordinate2D gGPSStationaryAnchorOutput = {0,0};
+static NSTimeInterval gGPSMovementCandidateSince = 0, gGPSStationaryCandidateSince = 0;
+static double gGPSPendingOutputEast = 0, gGPSPendingOutputNorth = 0;
+static NSTimeInterval gGPSLastOutputChangeTimestamp = 0;
+static NSTimeInterval gGPSLastAppliedIntervalSeconds = 0;
+static double gGPSStationaryRawDistance = 0;
 static NSUInteger gGPSFilterGeneration = 0;
 static char gGPSAdjustmentAssociationKey;
 static NSUInteger gGPSCoordinateGetterCalls = 0;
 static NSUInteger gGPSAdjustedFixCount = 0;
+static NSUInteger gGPSAccuracyRejectedCount = 0;
 static BOOL gGPSHasLiveFix = NO;
 static CLLocationCoordinate2D gGPSLiveRawCoordinate = {0,0};
 static CLLocationCoordinate2D gGPSLiveAdjustedCoordinate = {0,0};
@@ -132,10 +209,26 @@ static void SBResetGPSFilter(void){
     __atomic_store_n(&gGPSCoordinateGetterCalls, 0, __ATOMIC_RELAXED);
     @synchronized([CLLocation class]) {
         gGPSFilterInitialized = NO;
+        gGPSLastRawCoordinate = CLLocationCoordinate2DMake(0,0);
+        gGPSSpoofCoordinate = CLLocationCoordinate2DMake(0,0);
+        gGPSLastAccuracy = 0.0;
+        gGPSFilteredEastVelocity = 0.0; gGPSFilteredNorthVelocity = 0.0;
         gGPSHasFilteredVelocity = NO;
         gGPSHasCourse = NO;
+        gGPSPreviousCourse = 0.0;
         gGPSLastTimestamp = 0;
+        gGPSLastOutputChangeTimestamp = 0;
+        gGPSLastAppliedIntervalSeconds = 0;
+        gGPSIsStationary = YES;
+        gGPSStationaryAnchorRaw = CLLocationCoordinate2DMake(0,0);
+        gGPSStationaryAnchorOutput = CLLocationCoordinate2DMake(0,0);
+        gGPSMovementCandidateSince = 0;
+        gGPSStationaryCandidateSince = 0;
+        gGPSPendingOutputEast = 0;
+        gGPSPendingOutputNorth = 0;
+        gGPSStationaryRawDistance = 0;
         gGPSAdjustedFixCount = 0;
+        gGPSAccuracyRejectedCount = 0;
         gGPSHasLiveFix = NO;
         gGPSLiveRawCoordinate = CLLocationCoordinate2DMake(0,0);
         gGPSLiveAdjustedCoordinate = CLLocationCoordinate2DMake(0,0);
@@ -185,120 +278,223 @@ static double SBAlphaForSmoothing(double smoothing, NSTimeInterval dt){
     return isfinite(filteredAlpha) ? filteredAlpha : 1.0;
 }
 
+static double SBControlMagnitude(double value){ return isfinite(value)?fabs(value):0.0; }
+static double SBClampDouble(double value,double minimum,double maximum){ return fmax(minimum,fmin(maximum,value)); }
+static double SBNormalizedCourse(double course){
+    if(!isfinite(course)) return 0.0;
+    double value=fmod(course,360.0);
+    if(value<0) value+=360.0;
+    return value;
+}
+static CLLocationCoordinate2D SBGPSVisibleCoordinate(CLLocationCoordinate2D base){
+    return SBCoordinateByAddingMeters(base,gGPSOffsetEastMeters,gGPSOffsetNorthMeters);
+}
+static void SBQueueGPSOutputStep(double east,double north,NSTimeInterval timestamp,double *appliedEast,double *appliedNorth){
+    if(appliedEast) *appliedEast=0.0;
+    if(appliedNorth) *appliedNorth=0.0;
+    gGPSLastAppliedIntervalSeconds=0.0;
+    if(!isfinite(east)||!isfinite(north)||!isfinite(timestamp)) return;
+    double pendingEast=gGPSPendingOutputEast+east;
+    double pendingNorth=gGPSPendingOutputNorth+north;
+    if(!isfinite(pendingEast)||!isfinite(pendingNorth)){
+        gGPSPendingOutputEast=0.0; gGPSPendingOutputNorth=0.0;
+        return;
+    }
+    gGPSPendingOutputEast=pendingEast; gGPSPendingOutputNorth=pendingNorth;
+    double minInterval=SBControlMagnitude(gGPSMinUpdateIntervalSeconds);
+    if(minInterval>0.0 && gGPSLastOutputChangeTimestamp>0.0 && timestamp-gGPSLastOutputChangeTimestamp<minInterval) return;
+    double magnitude=hypot(gGPSPendingOutputEast,gGPSPendingOutputNorth);
+    if(!isfinite(magnitude)||magnitude<1e-6) return;
+    double maxStep=SBControlMagnitude(gGPSMaxStepMeters);
+    double stepEast=gGPSPendingOutputEast, stepNorth=gGPSPendingOutputNorth;
+    if(maxStep>0.0 && magnitude>maxStep){ double ratio=maxStep/magnitude; stepEast*=ratio; stepNorth*=ratio; }
+    CLLocationCoordinate2D before=gGPSSpoofCoordinate;
+    CLLocationCoordinate2D after=SBCoordinateByAddingMeters(before,stepEast,stepNorth);
+    if(!CLLocationCoordinate2DIsValid(after) || (after.latitude==before.latitude && after.longitude==before.longitude)) return;
+    double actualEast=0.0,actualNorth=0.0;
+    SBMetersBetweenCoordinates(before,after,&actualEast,&actualNorth);
+    if(!isfinite(actualEast)||!isfinite(actualNorth)) return;
+    gGPSSpoofCoordinate=after;
+    gGPSPendingOutputEast-=actualEast; gGPSPendingOutputNorth-=actualNorth;
+    double actualMagnitude=hypot(actualEast,actualNorth);
+    if(actualMagnitude>1e-6){
+        double elapsed=timestamp-gGPSLastOutputChangeTimestamp;
+        gGPSLastAppliedIntervalSeconds=isfinite(elapsed)&&elapsed>0.0?elapsed:0.0;
+        gGPSLastOutputChangeTimestamp=timestamp;
+    }
+    if(appliedEast) *appliedEast=actualEast;
+    if(appliedNorth) *appliedNorth=actualNorth;
+}
+
 static NSDictionary *SBGPSAdjustmentForLocation(CLLocation *location, CLLocationCoordinate2D rawCoordinate){
     if (!gEnabled || !gAppEnabled || !gGPSAdjustmentsEnabled || !CLLocationCoordinate2DIsValid(rawCoordinate)) return nil;
     @synchronized([CLLocation class]) {
         NSDictionary *cached = objc_getAssociatedObject(location, &gGPSAdjustmentAssociationKey);
         if ([cached isKindOfClass:[NSDictionary class]] && [cached[@"generation"] unsignedIntegerValue] == gGPSFilterGeneration) return cached;
 
-        NSDate *date = location.timestamp;
-        NSTimeInterval timestamp = date.timeIntervalSince1970;
-        double accuracy = location.horizontalAccuracy;
-        if (!isfinite(timestamp) || timestamp <= 0 || !isfinite(accuracy) || accuracy < 0) return nil;
+        NSDate *date=location.timestamp;
+        NSTimeInterval timestamp=date.timeIntervalSince1970;
+        BOOL previousRawAccuracy=gSBReadRawGPSAccuracy; gSBReadRawGPSAccuracy=YES;
+        double accuracy=location.horizontalAccuracy;
+        gSBReadRawGPSAccuracy=previousRawAccuracy;
+        if(!isfinite(timestamp)||timestamp<=0.0||!isfinite(accuracy)||accuracy<0.0) return nil;
 
-        CLLocationCoordinate2D adjusted = rawCoordinate;
-        BOOL hasSpeed = NO, hasCourse = NO;
-        double adjustedSpeed = 0, adjustedCourse = 0;
-        if (!gGPSFilterInitialized) {
-            gGPSFilterInitialized = YES;
-            gGPSLastRawCoordinate = rawCoordinate;
-            gGPSSpoofCoordinate = rawCoordinate;
-            gGPSLastTimestamp = timestamp;
-            gGPSLastAccuracy = accuracy;
-            gGPSFilteredEastVelocity = 0;
-            gGPSFilteredNorthVelocity = 0;
-            gGPSHasFilteredVelocity = NO;
-            gGPSHasCourse = NO;
+        CLLocationCoordinate2D adjusted=gGPSFilterInitialized?gGPSSpoofCoordinate:rawCoordinate;
+        BOOL hasSpeed=NO,hasCourse=NO;
+        double adjustedSpeed=0.0,adjustedCourse=0.0;
+        if(!gGPSFilterInitialized){
+            gGPSFilterInitialized=YES;
+            gGPSLastRawCoordinate=rawCoordinate;
+            gGPSSpoofCoordinate=rawCoordinate;
+            gGPSStationaryAnchorRaw=rawCoordinate;
+            gGPSStationaryAnchorOutput=rawCoordinate;
+            gGPSLastTimestamp=timestamp;
+            gGPSLastOutputChangeTimestamp=timestamp;
+            gGPSLastAccuracy=accuracy;
+            gGPSFilteredEastVelocity=0.0; gGPSFilteredNorthVelocity=0.0;
+            gGPSHasFilteredVelocity=NO; gGPSHasCourse=NO; gGPSIsStationary=YES;
+            gGPSMovementCandidateSince=0.0; gGPSStationaryCandidateSince=0.0;
+            gGPSPendingOutputEast=0.0; gGPSPendingOutputNorth=0.0;
         } else {
-            double dt = timestamp - gGPSLastTimestamp;
-            if (dt <= 0) return nil; // Do not let stale/history fixes rewind the live filter.
-            if (dt > 60.0) {
-                // Rebase on the new raw fix without snapping the adjusted route back to it.
-                gGPSLastRawCoordinate = rawCoordinate;
-                gGPSLastTimestamp = timestamp;
-                gGPSLastAccuracy = accuracy;
-                gGPSFilteredEastVelocity = 0;
-                gGPSFilteredNorthVelocity = 0;
-                gGPSHasFilteredVelocity = NO;
-                adjusted = gGPSSpoofCoordinate;
-                hasSpeed = YES;
-                adjustedSpeed = 0;
-                hasCourse = gGPSHasCourse;
-                adjustedCourse = gGPSPreviousCourse;
+            double dt=timestamp-gGPSLastTimestamp;
+            if(dt<=0.0) return nil;
+            if(dt>60.0){
+                // A long gap starts a fresh stationary-detection window without teleporting the output.
+                gGPSLastRawCoordinate=rawCoordinate; gGPSLastTimestamp=timestamp; gGPSLastAccuracy=accuracy;
+                gGPSStationaryAnchorRaw=rawCoordinate; gGPSStationaryAnchorOutput=gGPSSpoofCoordinate;
+                gGPSFilteredEastVelocity=0.0; gGPSFilteredNorthVelocity=0.0; gGPSHasFilteredVelocity=NO;
+                gGPSMovementCandidateSince=0.0; gGPSStationaryCandidateSince=0.0;
+                gGPSPendingOutputEast=0.0; gGPSPendingOutputNorth=0.0; gGPSIsStationary=YES;
+                hasSpeed=YES; adjustedSpeed=0.0; hasCourse=gGPSHasCourse; adjustedCourse=gGPSPreviousCourse;
             } else {
-                double east = 0, north = 0;
-                SBMetersBetweenCoordinates(gGPSLastRawCoordinate, rawCoordinate, &east, &north);
-                double rawDistance = hypot(east, north);
-                double maxPlausibleJump = 40.0 + 70.0 * dt + 2.0 * (accuracy + gGPSLastAccuracy);
-                if (!isfinite(rawDistance) || rawDistance > maxPlausibleJump) {
-                    // Drop a single implausible GPS jump and rebase, rather than teleport.
-                    gGPSLastRawCoordinate = rawCoordinate;
-                    gGPSLastTimestamp = timestamp;
-                    gGPSLastAccuracy = accuracy;
-                    gGPSFilteredEastVelocity = 0;
-                    gGPSFilteredNorthVelocity = 0;
-                    gGPSHasFilteredVelocity = NO;
-                    adjusted = gGPSSpoofCoordinate;
-                    hasSpeed = YES;
-                    adjustedSpeed = 0;
-                    hasCourse = gGPSHasCourse;
-                    adjustedCourse = gGPSPreviousCourse;
+                double east=0.0,north=0.0;
+                SBMetersBetweenCoordinates(gGPSLastRawCoordinate,rawCoordinate,&east,&north);
+                double rawDistance=hypot(east,north);
+                double rawSpeed=rawDistance/dt;
+                double maxPlausibleJump=40.0+70.0*dt+2.0*(accuracy+gGPSLastAccuracy);
+                if(!isfinite(rawDistance)||!isfinite(rawSpeed)||rawDistance>maxPlausibleJump){
+                    // Reject one implausible jump, rebase, and hold the last output coordinate.
+                    gGPSLastRawCoordinate=rawCoordinate; gGPSLastTimestamp=timestamp; gGPSLastAccuracy=accuracy;
+                    gGPSStationaryAnchorRaw=rawCoordinate; gGPSStationaryAnchorOutput=gGPSSpoofCoordinate;
+                    gGPSFilteredEastVelocity=0.0; gGPSFilteredNorthVelocity=0.0; gGPSHasFilteredVelocity=NO;
+                    gGPSMovementCandidateSince=0.0; gGPSStationaryCandidateSince=0.0;
+                    gGPSPendingOutputEast=0.0; gGPSPendingOutputNorth=0.0; gGPSIsStationary=YES;
+                    hasSpeed=YES; adjustedSpeed=0.0; hasCourse=gGPSHasCourse; adjustedCourse=gGPSPreviousCourse;
+                } else if(gGPSAccuracyFilterEnabled && accuracy>SBControlMagnitude(gGPSMaxHorizontalAccuracy)){
+                    // Low-confidence fixes cannot move the output; rebase so the next good fix does not jump.
+                    gGPSAccuracyRejectedCount++;
+                    gGPSLastRawCoordinate=rawCoordinate; gGPSLastTimestamp=timestamp; gGPSLastAccuracy=accuracy;
+                    gGPSFilteredEastVelocity=0.0; gGPSFilteredNorthVelocity=0.0; gGPSHasFilteredVelocity=NO;
+                    gGPSMovementCandidateSince=0.0; gGPSStationaryCandidateSince=0.0;
+                    if(gGPSIsStationary){ gGPSStationaryAnchorRaw=rawCoordinate; gGPSStationaryAnchorOutput=gGPSSpoofCoordinate; gGPSStationaryRawDistance=0.0; }
+                    hasSpeed=YES; adjustedSpeed=0.0; hasCourse=gGPSHasCourse; adjustedCourse=gGPSPreviousCourse;
                 } else {
-                    double alpha = SBAlphaForSmoothing(gGPSSmoothing, dt);
-                    double rawEastVelocity = east / dt;
-                    double rawNorthVelocity = north / dt;
-                    double previousEastVelocity = gGPSHasFilteredVelocity ? gGPSFilteredEastVelocity : 0.0;
-                    double previousNorthVelocity = gGPSHasFilteredVelocity ? gGPSFilteredNorthVelocity : 0.0;
-                    gGPSFilteredEastVelocity = alpha * rawEastVelocity + (1.0 - alpha) * previousEastVelocity;
-                    gGPSFilteredNorthVelocity = alpha * rawNorthVelocity + (1.0 - alpha) * previousNorthVelocity;
-                    gGPSHasFilteredVelocity = YES;
+                    double deadband=SBControlMagnitude(gGPSDeadbandMeters);
+                    double accuracyCutoff=SBControlMagnitude(gGPSMaxHorizontalAccuracy);
+                    double confidence=1.0;
+                    if(gGPSAccuracyFilterEnabled){
+                        deadband=fmax(deadband,accuracy);
+                        if(accuracyCutoff>0.0) confidence=SBClampDouble(1.0-accuracy/accuracyCutoff,0.05,1.0);
+                    }
+                    double alpha=SBAlphaForSmoothing(gGPSSmoothing,dt);
+                    if(gGPSAccuracyFilterEnabled && gGPSSmoothing>=0.0) alpha*=confidence;
+                    double speedThreshold=SBControlMagnitude(gGPSStationarySpeedThreshold);
+                    double confirmSeconds=SBControlMagnitude(gGPSMoveConfirmSeconds);
+                    double appliedEast=0.0,appliedNorth=0.0;
 
-                    double speedScale = gGPSSpeedMultiplier;
-                    double stepEast = gGPSFilteredEastVelocity * dt * speedScale;
-                    double stepNorth = gGPSFilteredNorthVelocity * dt * speedScale;
-                    if (!isfinite(stepEast) || !isfinite(stepNorth)) {
-                        // Keep corrupt/overflowing arithmetic from producing invalid coordinates.
-                        gGPSFilteredEastVelocity = 0;
-                        gGPSFilteredNorthVelocity = 0;
-                        gGPSHasFilteredVelocity = NO;
-                        stepEast = 0;
-                        stepNorth = 0;
-                    }
-                    adjusted = SBCoordinateByAddingMeters(gGPSSpoofCoordinate, stepEast, stepNorth);
-                    double adjustedDistance = hypot(stepEast, stepNorth);
-                    adjustedSpeed = isfinite(adjustedDistance / dt) ? adjustedDistance / dt : 0.0;
-                    hasSpeed = YES;
-                    if (adjustedDistance > 0.05 && isfinite(adjustedDistance)) {
-                        adjustedCourse = atan2(stepEast, stepNorth) * 180.0 / M_PI;
-                        if (adjustedCourse < 0) adjustedCourse += 360.0;
-                        gGPSPreviousCourse = adjustedCourse;
-                        gGPSHasCourse = YES;
+                    if(gGPSIsStationary){
+                        double anchorEast=0.0,anchorNorth=0.0;
+                        SBMetersBetweenCoordinates(gGPSStationaryAnchorRaw,rawCoordinate,&anchorEast,&anchorNorth);
+                        double anchorDistance=hypot(anchorEast,anchorNorth);
+                        gGPSStationaryRawDistance=isfinite(anchorDistance)?anchorDistance:0.0;
+                        BOOL movingCandidate=anchorDistance>deadband && rawSpeed>=speedThreshold;
+                        if(movingCandidate){
+                            if(gGPSMovementCandidateSince<=0.0) gGPSMovementCandidateSince=timestamp;
+                            if(timestamp-gGPSMovementCandidateSince>=confirmSeconds){
+                                // Release accumulated real travel only after sustained movement is confirmed.
+                                double existingEast=0.0,existingNorth=0.0;
+                                SBMetersBetweenCoordinates(gGPSStationaryAnchorOutput,gGPSSpoofCoordinate,&existingEast,&existingNorth);
+                                double targetEast=anchorEast*gGPSSpeedMultiplier-existingEast-gGPSPendingOutputEast;
+                                double targetNorth=anchorNorth*gGPSSpeedMultiplier-existingNorth-gGPSPendingOutputNorth;
+                                gGPSIsStationary=NO; gGPSMovementCandidateSince=0.0;
+                                gGPSFilteredEastVelocity=0.0; gGPSFilteredNorthVelocity=0.0; gGPSHasFilteredVelocity=NO;
+                                SBQueueGPSOutputStep(targetEast,targetNorth,timestamp,&appliedEast,&appliedNorth);
+                            } else if(SBControlMagnitude(gGPSStationaryDriftMetersPerMinute)>0.0 && anchorDistance>deadband){
+                                double driftCap=SBControlMagnitude(gGPSStationaryDriftMetersPerMinute)*dt/60.0;
+                                double driftDistance=hypot(east,north);
+                                double ratio=(driftDistance>0.0 && driftDistance>driftCap)?driftCap/driftDistance:1.0;
+                                SBQueueGPSOutputStep(east*ratio,north*ratio,timestamp,&appliedEast,&appliedNorth);
+                            }
+                        } else {
+                            gGPSMovementCandidateSince=0.0;
+                            if(SBControlMagnitude(gGPSStationaryDriftMetersPerMinute)>0.0 && anchorDistance>deadband){
+                                double driftCap=SBControlMagnitude(gGPSStationaryDriftMetersPerMinute)*dt/60.0;
+                                double driftDistance=hypot(east,north);
+                                double ratio=(driftDistance>0.0 && driftDistance>driftCap)?driftCap/driftDistance:1.0;
+                                SBQueueGPSOutputStep(east*ratio,north*ratio,timestamp,&appliedEast,&appliedNorth);
+                            }
+                        }
                     } else {
-                        adjustedCourse = gGPSPreviousCourse;
+                        BOOL stopCandidate=rawSpeed<speedThreshold;
+                        if(stopCandidate){
+                            if(gGPSStationaryCandidateSince<=0.0) gGPSStationaryCandidateSince=timestamp;
+                            if(timestamp-gGPSStationaryCandidateSince>=confirmSeconds){
+                                gGPSIsStationary=YES;
+                                gGPSStationaryAnchorRaw=rawCoordinate; gGPSStationaryAnchorOutput=gGPSSpoofCoordinate;
+                                gGPSStationaryRawDistance=0.0;
+                                gGPSMovementCandidateSince=0.0; gGPSStationaryCandidateSince=0.0;
+                                gGPSFilteredEastVelocity=0.0; gGPSFilteredNorthVelocity=0.0; gGPSHasFilteredVelocity=NO;
+                                gGPSPendingOutputEast=0.0; gGPSPendingOutputNorth=0.0;
+                            }
+                        } else gGPSStationaryCandidateSince=0.0;
+
+                        if(!gGPSIsStationary){
+                            double rawEastVelocity=east/dt,rawNorthVelocity=north/dt;
+                            double previousEastVelocity=gGPSHasFilteredVelocity?gGPSFilteredEastVelocity:0.0;
+                            double previousNorthVelocity=gGPSHasFilteredVelocity?gGPSFilteredNorthVelocity:0.0;
+                            gGPSFilteredEastVelocity=alpha*rawEastVelocity+(1.0-alpha)*previousEastVelocity;
+                            gGPSFilteredNorthVelocity=alpha*rawNorthVelocity+(1.0-alpha)*previousNorthVelocity;
+                            gGPSHasFilteredVelocity=YES;
+                            double stepEast=gGPSFilteredEastVelocity*dt*gGPSSpeedMultiplier;
+                            double stepNorth=gGPSFilteredNorthVelocity*dt*gGPSSpeedMultiplier;
+                            if(!isfinite(stepEast)||!isfinite(stepNorth)){
+                                gGPSFilteredEastVelocity=0.0; gGPSFilteredNorthVelocity=0.0; gGPSHasFilteredVelocity=NO;
+                                stepEast=0.0; stepNorth=0.0;
+                            }
+                            SBQueueGPSOutputStep(stepEast,stepNorth,timestamp,&appliedEast,&appliedNorth);
+                        }
                     }
-                    hasCourse = gGPSHasCourse;
-                    gGPSSpoofCoordinate = adjusted;
-                    gGPSLastRawCoordinate = rawCoordinate;
-                    gGPSLastTimestamp = timestamp;
-                    gGPSLastAccuracy = accuracy;
+
+                    double appliedDistance=hypot(appliedEast,appliedNorth);
+                    double speedInterval=gGPSLastAppliedIntervalSeconds>0.0?gGPSLastAppliedIntervalSeconds:dt;
+                    adjustedSpeed=isfinite(appliedDistance/speedInterval)?appliedDistance/speedInterval:0.0;
+                    hasSpeed=YES;
+                    if(appliedDistance>0.05 && isfinite(appliedDistance)){
+                        adjustedCourse=SBNormalizedCourse(atan2(appliedEast,appliedNorth)*180.0/M_PI);
+                        gGPSPreviousCourse=adjustedCourse; gGPSHasCourse=YES;
+                    } else adjustedCourse=gGPSPreviousCourse;
+                    hasCourse=gGPSHasCourse;
+                    gGPSLastRawCoordinate=rawCoordinate; gGPSLastTimestamp=timestamp; gGPSLastAccuracy=accuracy;
                 }
             }
         }
 
-        NSDictionary *result = @{
-            @"latitude": @(adjusted.latitude),
-            @"longitude": @(adjusted.longitude),
-            @"hasSpeed": @(hasSpeed),
-            @"speed": @(adjustedSpeed),
-            @"hasCourse": @(hasCourse),
-            @"course": @(adjustedCourse),
-            @"generation": @(gGPSFilterGeneration)
+        adjusted=gGPSSpoofCoordinate;
+        CLLocationCoordinate2D visible=SBGPSVisibleCoordinate(adjusted);
+        NSDictionary *result=@{
+            @"latitude":@(visible.latitude),
+            @"longitude":@(visible.longitude),
+            @"hasSpeed":@(hasSpeed),
+            @"speed":@(adjustedSpeed),
+            @"hasCourse":@(hasCourse),
+            @"course":@(adjustedCourse),
+            @"generation":@(gGPSFilterGeneration)
         };
-        gGPSLiveRawCoordinate = rawCoordinate;
-        gGPSLiveAdjustedCoordinate = adjusted;
+        gGPSLiveRawCoordinate=rawCoordinate;
+        gGPSLiveAdjustedCoordinate=visible;
         gGPSAdjustedFixCount++;
-        gGPSHasLiveFix = YES;
-        objc_setAssociatedObject(location, &gGPSAdjustmentAssociationKey, result, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        gGPSHasLiveFix=YES;
+        objc_setAssociatedObject(location,&gGPSAdjustmentAssociationKey,result,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         return result;
     }
 }
@@ -393,6 +589,22 @@ static void loadPrefs(void){
     double storedSpeed=readD(local,@"gpsSpeed",1.0);
     gGPSSmoothing=isfinite(storedSmoothing)?storedSmoothing:0.65;
     gGPSSpeedMultiplier=isfinite(storedSpeed)?storedSpeed:1.0;
+    gGPSDeadbandMeters=readD(local,@"gpsDeadband",10.0);
+    gGPSStationaryDriftMetersPerMinute=readD(local,@"gpsStationaryDrift",0.0);
+    gGPSMoveConfirmSeconds=readD(local,@"gpsMoveConfirm",3.0);
+    gGPSStationarySpeedThreshold=readD(local,@"gpsStationarySpeed",0.5);
+    gGPSMaxStepMeters=readD(local,@"gpsMaxStep",10.0);
+    gGPSMinUpdateIntervalSeconds=readD(local,@"gpsMinInterval",0.0);
+    gGPSAccuracyFilterEnabled=readB(local,@"gpsAccuracyFilterEnabled",YES);
+    gGPSMaxHorizontalAccuracy=readD(local,@"gpsMaxAccuracy",50.0);
+    gGPSAltitudeScale=readD(local,@"gpsAltitudeScale",1.0);
+    gGPSAltitudeOffsetMeters=readD(local,@"gpsAltitudeOffset",0.0);
+    gGPSHorizontalAccuracyScale=readD(local,@"gpsHorizontalAccuracyScale",1.0);
+    gGPSVerticalAccuracyScale=readD(local,@"gpsVerticalAccuracyScale",1.0);
+    gGPSReportedSpeedScale=readD(local,@"gpsReportedSpeedScale",1.0);
+    gGPSCourseOffsetDegrees=readD(local,@"gpsCourseOffset",0.0);
+    gGPSOffsetEastMeters=readD(local,@"gpsOffsetEast",0.0);
+    gGPSOffsetNorthMeters=readD(local,@"gpsOffsetNorth",0.0);
     gBtnOpacity=readD(local,@"btnOpacity",0.92); gBtnSize=readD(local,@"btnSize",54);
 }
 
@@ -421,6 +633,22 @@ static void savePrefs(void){
     app[@"gpsEnabled"]=@(gGPSAdjustmentsEnabled);
     app[@"gpsSmoothing"]=@(gGPSSmoothing);
     app[@"gpsSpeed"]=@(gGPSSpeedMultiplier);
+    app[@"gpsDeadband"]=@(gGPSDeadbandMeters);
+    app[@"gpsStationaryDrift"]=@(gGPSStationaryDriftMetersPerMinute);
+    app[@"gpsMoveConfirm"]=@(gGPSMoveConfirmSeconds);
+    app[@"gpsStationarySpeed"]=@(gGPSStationarySpeedThreshold);
+    app[@"gpsMaxStep"]=@(gGPSMaxStepMeters);
+    app[@"gpsMinInterval"]=@(gGPSMinUpdateIntervalSeconds);
+    app[@"gpsAccuracyFilterEnabled"]=@(gGPSAccuracyFilterEnabled);
+    app[@"gpsMaxAccuracy"]=@(gGPSMaxHorizontalAccuracy);
+    app[@"gpsAltitudeScale"]=@(gGPSAltitudeScale);
+    app[@"gpsAltitudeOffset"]=@(gGPSAltitudeOffsetMeters);
+    app[@"gpsHorizontalAccuracyScale"]=@(gGPSHorizontalAccuracyScale);
+    app[@"gpsVerticalAccuracyScale"]=@(gGPSVerticalAccuracyScale);
+    app[@"gpsReportedSpeedScale"]=@(gGPSReportedSpeedScale);
+    app[@"gpsCourseOffset"]=@(gGPSCourseOffsetDegrees);
+    app[@"gpsOffsetEast"]=@(gGPSOffsetEastMeters);
+    app[@"gpsOffsetNorth"]=@(gGPSOffsetNorthMeters);
     app[@"btnOpacity"]=@(gBtnOpacity); app[@"btnSize"]=@(gBtnSize);
     apps[gAppBundleID]=app;
     [d setObject:apps forKey:@"appPrefs"];
@@ -488,17 +716,33 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     if(!gEnabled || !gAppEnabled || !gGPSAdjustmentsEnabled) return raw;
     CLLocationCoordinate2D ignored=self.coordinate; (void)ignored;
     NSDictionary *adjusted=objc_getAssociatedObject(self,&gGPSAdjustmentAssociationKey);
-    if(![adjusted isKindOfClass:[NSDictionary class]]) return raw;
-    if([adjusted[@"hasSpeed"] boolValue]) return [adjusted[@"speed"] doubleValue];
-    return raw;
+    double base=[adjusted isKindOfClass:[NSDictionary class]] && [adjusted[@"hasSpeed"] boolValue]?[adjusted[@"speed"] doubleValue]:raw;
+    if(base<0.0) return base;
+    return base*gGPSReportedSpeedScale;
 }
 - (CLLocationDirection)course{
     CLLocationDirection raw=%orig;
     if(!gEnabled || !gAppEnabled || !gGPSAdjustmentsEnabled) return raw;
     CLLocationCoordinate2D ignored=self.coordinate; (void)ignored;
     NSDictionary *adjusted=objc_getAssociatedObject(self,&gGPSAdjustmentAssociationKey);
-    if([adjusted isKindOfClass:[NSDictionary class]] && [adjusted[@"hasCourse"] boolValue]) return [adjusted[@"course"] doubleValue];
-    return raw;
+    double base=[adjusted isKindOfClass:[NSDictionary class]] && [adjusted[@"hasCourse"] boolValue]?[adjusted[@"course"] doubleValue]:raw;
+    if(base<0.0) return base;
+    return SBNormalizedCourse(base+gGPSCourseOffsetDegrees);
+}
+- (CLLocationDistance)altitude{
+    CLLocationDistance raw=%orig;
+    if(!gEnabled || !gAppEnabled || !gGPSAdjustmentsEnabled) return raw;
+    return raw*gGPSAltitudeScale+gGPSAltitudeOffsetMeters;
+}
+- (CLLocationAccuracy)horizontalAccuracy{
+    CLLocationAccuracy raw=%orig;
+    if(gSBReadRawGPSAccuracy || !gEnabled || !gAppEnabled || !gGPSAdjustmentsEnabled || raw<0.0) return raw;
+    return raw*gGPSHorizontalAccuracyScale;
+}
+- (CLLocationAccuracy)verticalAccuracy{
+    CLLocationAccuracy raw=%orig;
+    if(!gEnabled || !gAppEnabled || !gGPSAdjustmentsEnabled || raw<0.0) return raw;
+    return raw*gGPSVerticalAccuracyScale;
 }
 %end
 
@@ -560,12 +804,14 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
 
 @implementation SBSensorBenderOverlay {
     UIWindow *_floatWindow; UIWindow *_panelWindow;
+    __weak UIWindow *_previousKeyWindow;
+    NSString *_overlayInstanceID;
     SBPassThroughView *_rootView; SBPassThroughView *_panelRootView;
     UIButton *_floatBtn; UIView *_panelBG; UIView *_card; UIScrollView *_scroll; UIStackView *_stack;
     UILabel *_gpsLiveLabel;
     NSMutableDictionary *_sliders; NSMutableDictionary *_valueLabels; NSMutableDictionary *_liveLabels;
     NSMutableDictionary *_sensorHeaders; NSMutableDictionary *_absRows; NSMutableDictionary *_advContainers;
-    UISwitch *_enabledSwitch; UISwitch *_gpsAdjustmentsSwitch;
+    UISwitch *_enabledSwitch; UISwitch *_gpsAdjustmentsSwitch; UISwitch *_gpsAccuracySwitch;
     NSMutableDictionary *_usageSwitches;
     NSTimer *_liveTimer;
     BOOL _didAutoOpenPanel; BOOL _autoOpenScheduled;
@@ -590,7 +836,10 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
 }
 - (void)reconcileVisibility{
     if(SBShouldShowOverlay() && SBActualApplicationState()!=UIApplicationStateBackground) [self installIfNeeded];
-    else dispatch_async(dispatch_get_main_queue(),^{ self->_panelWindow.hidden=YES; self->_floatWindow.hidden=YES; });
+    else dispatch_async(dispatch_get_main_queue(),^{
+        self->_panelWindow.hidden=YES; self->_floatWindow.hidden=YES;
+        if(self->_previousKeyWindow && !self->_previousKeyWindow.hidden) [self->_previousKeyWindow makeKeyWindow];
+    });
 }
 - (void)scheduleAutoOpenPanel{
     if(_didAutoOpenPanel || _autoOpenScheduled) return;
@@ -598,6 +847,8 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(0.45*NSEC_PER_SEC)),dispatch_get_main_queue(),^{
         self->_autoOpenScheduled=NO;
         if(self->_didAutoOpenPanel || !SBShouldShowOverlay() || SBActualApplicationState()!=UIApplicationStateActive || !self->_panelWindow) return;
+        // Avoid competing auto-open panels when several injected tweaks share this process.
+        if(SBHasVisibleCompetingPanel(self->_panelWindow)) return;
         self->_didAutoOpenPanel=YES;
         if(self->_panelWindow.hidden) [self togglePanel];
     });
@@ -614,21 +865,24 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
 - (void)createWindow{
     if(!SBShouldShowOverlay() || SBActualApplicationState()==UIApplicationStateBackground) return;
     UIWindowScene *scene=[self findWindowScene];
-    CGRect floatFrame=CGRectMake(20,90,gBtnSize,gBtnSize);
-    // Float window - tiny, only button area, never blocks app
+    CGRect fallbackFrame=CGRectMake(20,90,gBtnSize,gBtnSize);
+    // Place this button in a free small-window slot so other injected menus remain tappable.
     if(scene){
         _floatWindow=[[UIWindow alloc] initWithWindowScene:scene];
         _panelWindow=[[UIWindow alloc] initWithWindowScene:scene];
     } else {
-        _floatWindow=[[UIWindow alloc] initWithFrame:floatFrame];
+        _floatWindow=[[UIWindow alloc] initWithFrame:fallbackFrame];
         _panelWindow=[[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     }
-    _floatWindow.frame=floatFrame; _floatWindow.windowLevel=UIWindowLevelAlert+100;
+    CGRect floatFrame=SBPreferredFloatFrame(scene,gBtnSize,_floatWindow);
+    _overlayInstanceID=[[NSUUID UUID] UUIDString];
+    _floatWindow.frame=floatFrame; _floatWindow.windowLevel=UIWindowLevelAlert+1.0;
+    _floatWindow.accessibilityIdentifier=[NSString stringWithFormat:@"SensorBender.Float.%@",_overlayInstanceID];
     _floatWindow.backgroundColor=[UIColor clearColor]; _floatWindow.hidden=NO; _floatWindow.userInteractionEnabled=YES;
     UIViewController *vc1=[UIViewController new]; vc1.view.backgroundColor=[UIColor clearColor];
     _rootView=[SBPassThroughView new]; _rootView.frame=CGRectMake(0,0,floatFrame.size.width,floatFrame.size.height); _rootView.backgroundColor=[UIColor clearColor];
     vc1.view=_rootView;
-    _floatWindow.rootViewController=vc1; [_floatWindow makeKeyAndVisible];
+    _floatWindow.rootViewController=vc1;
 
     _floatBtn=[UIButton buttonWithType:UIButtonTypeCustom];
     _floatBtn.frame=CGRectMake(0,0,gBtnSize,gBtnSize); _floatBtn.layer.cornerRadius=gBtnSize/2;
@@ -638,11 +892,12 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     _floatBtn.accessibilityLabel=@"SensorBender controls";
     [_floatBtn addTarget:self action:@selector(togglePanel) forControlEvents:UIControlEventTouchUpInside];
     UIPanGestureRecognizer *pan=[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
+    pan.cancelsTouchesInView=YES; pan.delaysTouchesBegan=NO; pan.minimumNumberOfTouches=1; pan.maximumNumberOfTouches=1;
     [_floatBtn addGestureRecognizer:pan];
     [_rootView addSubview:_floatBtn];
 
-    // Panel window - full screen but hidden until opened
-    _panelWindow.windowLevel=UIWindowLevelAlert+101; _panelWindow.backgroundColor=[UIColor clearColor]; _panelWindow.hidden=YES;
+    // Panel window stays hidden until opened; its level is raised only while visible.
+    _panelWindow.windowLevel=UIWindowLevelAlert+2.0; _panelWindow.accessibilityIdentifier=[NSString stringWithFormat:@"SensorBender.Panel.%@",_overlayInstanceID]; _panelWindow.backgroundColor=[UIColor clearColor]; _panelWindow.hidden=YES;
     UIViewController *vc2=[UIViewController new]; vc2.view.backgroundColor=[UIColor clearColor];
     _panelRootView=[SBPassThroughView new]; _panelRootView.frame=[UIScreen mainScreen].bounds; _panelRootView.backgroundColor=[UIColor clearColor];
     vc2.view=_panelRootView;
@@ -688,15 +943,32 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     [self scheduleAutoOpenPanel];
 }
 - (void)handlePan:(UIPanGestureRecognizer*)p{
-    CGPoint t=[p translationInView:_floatWindow];
+    CGPoint translation=[p translationInView:nil];
+    CGRect bounds=[UIScreen mainScreen].bounds;
+    CGFloat half=gBtnSize*0.5, minY=MAX(half+12.0,82.0), maxY=bounds.size.height-half-12.0;
     if(p.state==UIGestureRecognizerStateBegan) _panStart=_floatWindow.center;
-    _floatWindow.center=CGPointMake(_panStart.x+t.x,_panStart.y+t.y);
-    if(p.state==UIGestureRecognizerStateEnded){
-        CGFloat mid=CGRectGetMidX([UIScreen mainScreen].bounds); CGFloat tx= _floatWindow.center.x < mid ? 36 : [UIScreen mainScreen].bounds.size.width-36;
-        [UIView animateWithDuration:0.25 animations:^{ self->_floatWindow.center=CGPointMake(tx, self->_floatWindow.center.y); }];
+    CGFloat x=SBClampDouble(_panStart.x+translation.x,half+8.0,bounds.size.width-half-8.0);
+    CGFloat y=SBClampDouble(_panStart.y+translation.y,minY,MAX(minY,maxY));
+    _floatWindow.center=CGPointMake(x,y);
+    if(p.state==UIGestureRecognizerStateEnded || p.state==UIGestureRecognizerStateCancelled){
+        CGFloat targetX=x<CGRectGetMidX(bounds)?half+12.0:bounds.size.width-half-12.0;
+        [UIView animateWithDuration:0.22 animations:^{ self->_floatWindow.center=CGPointMake(targetX,y); }];
     }
 }
-- (void)togglePanel{ BOOL show=_panelWindow.hidden; if(show){ [self refreshUI]; _panelWindow.hidden=NO; [_panelWindow makeKeyAndVisible]; } else { _panelWindow.hidden=YES; [_floatWindow makeKeyAndVisible]; } _floatBtn.alpha=show?MIN(gBtnOpacity,0.35):gBtnOpacity; }
+- (void)togglePanel{
+    BOOL show=_panelWindow.hidden;
+    if(show){
+        [self refreshUI];
+        for(UIWindow *window in SBAllAppWindows()) if(window.isKeyWindow && window!=_panelWindow && window!=_floatWindow){ _previousKeyWindow=window; break; }
+        _panelWindow.windowLevel=SBNextOverlayWindowLevel(_floatWindow,_panelWindow);
+        _panelWindow.hidden=NO; [_panelWindow makeKeyAndVisible];
+    } else {
+        _panelWindow.hidden=YES;
+        if(_previousKeyWindow && !_previousKeyWindow.hidden) [_previousKeyWindow makeKeyWindow];
+        else if(_floatWindow) [_floatWindow makeKeyWindow];
+    }
+    _floatBtn.alpha=show?MIN(gBtnOpacity,0.35):gBtnOpacity;
+}
 - (UILabel*)section:(NSString*)t{ UILabel *l=[UILabel new]; l.text=t; l.font=[UIFont systemFontOfSize:13 weight:UIFontWeightSemibold]; l.textColor=[UIColor secondaryLabelColor]; l.numberOfLines=0; return l; }
 - (UIView*)rowForKey:(NSString*)key label:(NSString*)lab min:(float)mn max:(float)mx{
     UIView *row=[UIView new];
@@ -729,7 +1001,23 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     if([k isEqualToString:@"userAccel"]) return gBase[S_USERACCEL]; if([k isEqualToString:@"gravity"]) return gBase[S_GRAVITY]; if([k isEqualToString:@"rotRate"]) return gBase[S_ROTRATE];
     if([k isEqualToString:@"magCal"]) return gBase[S_MAGCAL]; if([k isEqualToString:@"attitude"]) return gBase[S_ATT];
     if([k isEqualToString:@"pressure"]) return mPressure; if([k isEqualToString:@"relAlt"]) return mRelAlt;
-    if([k isEqualToString:@"gpsSmoothing"]) return gGPSSmoothing; if([k isEqualToString:@"gpsSpeed"]) return gGPSSpeedMultiplier;
+    if([k isEqualToString:@"gpsSmoothing"]) return gGPSSmoothing;
+    if([k isEqualToString:@"gpsSpeed"]) return gGPSSpeedMultiplier;
+    if([k isEqualToString:@"gpsDeadband"]) return gGPSDeadbandMeters;
+    if([k isEqualToString:@"gpsStationaryDrift"]) return gGPSStationaryDriftMetersPerMinute;
+    if([k isEqualToString:@"gpsMoveConfirm"]) return gGPSMoveConfirmSeconds;
+    if([k isEqualToString:@"gpsStationarySpeed"]) return gGPSStationarySpeedThreshold;
+    if([k isEqualToString:@"gpsMaxStep"]) return gGPSMaxStepMeters;
+    if([k isEqualToString:@"gpsMinInterval"]) return gGPSMinUpdateIntervalSeconds;
+    if([k isEqualToString:@"gpsMaxAccuracy"]) return gGPSMaxHorizontalAccuracy;
+    if([k isEqualToString:@"gpsAltitudeScale"]) return gGPSAltitudeScale;
+    if([k isEqualToString:@"gpsAltitudeOffset"]) return gGPSAltitudeOffsetMeters;
+    if([k isEqualToString:@"gpsHorizontalAccuracyScale"]) return gGPSHorizontalAccuracyScale;
+    if([k isEqualToString:@"gpsVerticalAccuracyScale"]) return gGPSVerticalAccuracyScale;
+    if([k isEqualToString:@"gpsReportedSpeedScale"]) return gGPSReportedSpeedScale;
+    if([k isEqualToString:@"gpsCourseOffset"]) return gGPSCourseOffsetDegrees;
+    if([k isEqualToString:@"gpsOffsetEast"]) return gGPSOffsetEastMeters;
+    if([k isEqualToString:@"gpsOffsetNorth"]) return gGPSOffsetNorthMeters;
     NSArray *keys=sensorKeys(); NSArray *ax=axisLetters(); for(int s=0;s<S_COUNT;s++) for(int a=0;a<3;a++) if([[keys[s] stringByAppendingString:ax[a]] isEqualToString:k]) return gAxis[s][a];
     return 1;
 }
@@ -740,6 +1028,21 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     else if([k isEqualToString:@"pressure"]) mPressure=v; else if([k isEqualToString:@"relAlt"]) mRelAlt=v;
     else if([k isEqualToString:@"gpsSmoothing"]) gGPSSmoothing=v;
     else if([k isEqualToString:@"gpsSpeed"]) gGPSSpeedMultiplier=v;
+    else if([k isEqualToString:@"gpsDeadband"]) gGPSDeadbandMeters=v;
+    else if([k isEqualToString:@"gpsStationaryDrift"]) gGPSStationaryDriftMetersPerMinute=v;
+    else if([k isEqualToString:@"gpsMoveConfirm"]) gGPSMoveConfirmSeconds=v;
+    else if([k isEqualToString:@"gpsStationarySpeed"]) gGPSStationarySpeedThreshold=v;
+    else if([k isEqualToString:@"gpsMaxStep"]) gGPSMaxStepMeters=v;
+    else if([k isEqualToString:@"gpsMinInterval"]) gGPSMinUpdateIntervalSeconds=v;
+    else if([k isEqualToString:@"gpsMaxAccuracy"]) gGPSMaxHorizontalAccuracy=v;
+    else if([k isEqualToString:@"gpsAltitudeScale"]) gGPSAltitudeScale=v;
+    else if([k isEqualToString:@"gpsAltitudeOffset"]) gGPSAltitudeOffsetMeters=v;
+    else if([k isEqualToString:@"gpsHorizontalAccuracyScale"]) gGPSHorizontalAccuracyScale=v;
+    else if([k isEqualToString:@"gpsVerticalAccuracyScale"]) gGPSVerticalAccuracyScale=v;
+    else if([k isEqualToString:@"gpsReportedSpeedScale"]) gGPSReportedSpeedScale=v;
+    else if([k isEqualToString:@"gpsCourseOffset"]) gGPSCourseOffsetDegrees=v;
+    else if([k isEqualToString:@"gpsOffsetEast"]) gGPSOffsetEastMeters=v;
+    else if([k isEqualToString:@"gpsOffsetNorth"]) gGPSOffsetNorthMeters=v;
 }
 - (void)expandSliderForKey:(NSString*)key value:(double)value{
     UISlider *slider=_sliders[key];
@@ -833,6 +1136,16 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     [NSLayoutConstraint activateConstraints:@[[line.topAnchor constraintEqualToAnchor:row.topAnchor constant:8],[line.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:10],[line.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-6],[line.bottomAnchor constraintEqualToAnchor:row.bottomAnchor constant:-8]]];
     return row;
 }
+- (UIView*)gpsAccuracyOptionRow{
+    UIView *row=[UIView new]; row.backgroundColor=[UIColor secondarySystemGroupedBackgroundColor]; row.layer.cornerRadius=10; row.layer.borderWidth=0.5; row.layer.borderColor=[UIColor separatorColor].CGColor; row.layer.masksToBounds=YES;
+    UILabel *heading=[UILabel new]; heading.text=@"Use GPS accuracy to reject noisy fixes"; heading.font=[UIFont systemFontOfSize:13 weight:UIFontWeightMedium]; heading.numberOfLines=0;
+    UILabel *detail=[UILabel new]; detail.text=@"Fixes worse than the cutoff are held; when smoothing is non-negative, lower-confidence fixes are smoothed more strongly."; detail.font=[UIFont systemFontOfSize:10]; detail.textColor=[UIColor secondaryLabelColor]; detail.numberOfLines=0;
+    UIStackView *copy=[[UIStackView alloc] initWithArrangedSubviews:@[heading,detail]]; copy.axis=UILayoutConstraintAxisVertical; copy.spacing=3;
+    _gpsAccuracySwitch=[UISwitch new]; _gpsAccuracySwitch.on=gGPSAccuracyFilterEnabled; _gpsAccuracySwitch.transform=CGAffineTransformMakeScale(0.72,0.72); [_gpsAccuracySwitch addTarget:self action:@selector(gpsAccuracyToggle:) forControlEvents:UIControlEventValueChanged];
+    UIStackView *line=[[UIStackView alloc] initWithArrangedSubviews:@[copy,_gpsAccuracySwitch]]; line.axis=UILayoutConstraintAxisHorizontal; line.spacing=8; line.alignment=UIStackViewAlignmentCenter; line.translatesAutoresizingMaskIntoConstraints=NO;
+    [row addSubview:line]; [NSLayoutConstraint activateConstraints:@[[line.topAnchor constraintEqualToAnchor:row.topAnchor constant:8],[line.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:10],[line.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-6],[line.bottomAnchor constraintEqualToAnchor:row.bottomAnchor constant:-8]]];
+    return row;
+}
 - (void)buildCard{
     UILabel *t=[UILabel new]; t.text=@"SensorBender"; t.font=[UIFont systemFontOfSize:22 weight:UIFontWeightSemibold]; t.textAlignment=NSTextAlignmentLeft; [_stack addArrangedSubview:t];
     UILabel *sub=[UILabel new]; sub.text=@"Motion and location controls"; sub.font=[UIFont systemFontOfSize:13]; sub.textColor=[UIColor secondaryLabelColor]; sub.numberOfLines=0; sub.textAlignment=NSTextAlignmentLeft; [_stack addArrangedSubview:sub];
@@ -857,9 +1170,27 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     [_gpsAdjustmentsSwitch addTarget:self action:@selector(gpsAdjustmentsToggle:) forControlEvents:UIControlEventValueChanged];
     [gpsEnabledRow addArrangedSubview:gpsEnabledTitle]; [gpsEnabledRow addArrangedSubview:gpsSpacer]; [gpsEnabledRow addArrangedSubview:_gpsAdjustmentsSwitch];
     [_stack addArrangedSubview:gpsEnabledRow];
-    [_stack addArrangedSubview:[self rowForKey:@"gpsSmoothing" label:@"Jitter smoothing" min:0 max:0.95]];
-    [_stack addArrangedSubview:[self rowForKey:@"gpsSpeed" label:@"GPS speed scale" min:0.1 max:1.0]];
-    UILabel *gpsHint=[UILabel new]; gpsHint.text=@"Positive smoothing increases filtering; negative values amplify changes. Speed scale multiplies the adjusted path: 0 pauses it, negative values reverse it, and values above 1 speed it up. This is separate from acceleration scaling."; gpsHint.font=[UIFont systemFontOfSize:10]; gpsHint.textColor=[UIColor secondaryLabelColor]; gpsHint.numberOfLines=0; [_stack addArrangedSubview:gpsHint];
+    [_stack addArrangedSubview:[self section:@"GPS path stability"]];
+    [_stack addArrangedSubview:[self rowForKey:@"gpsSmoothing" label:@"Smoothing response" min:0 max:0.95]];
+    [_stack addArrangedSubview:[self rowForKey:@"gpsSpeed" label:@"Moving distance scale (×)" min:0 max:1.5]];
+    [_stack addArrangedSubview:[self rowForKey:@"gpsDeadband" label:@"Stationary radius (m)" min:0 max:50]];
+    [_stack addArrangedSubview:[self rowForKey:@"gpsStationaryDrift" label:@"Stationary drift cap (m/min)" min:0 max:10]];
+    [_stack addArrangedSubview:[self rowForKey:@"gpsMoveConfirm" label:@"Movement confirmation (s)" min:0 max:10]];
+    [_stack addArrangedSubview:[self rowForKey:@"gpsStationarySpeed" label:@"Moving threshold (m/s)" min:0 max:2]];
+    [_stack addArrangedSubview:[self rowForKey:@"gpsMaxStep" label:@"Max output step (m)" min:0 max:50]];
+    [_stack addArrangedSubview:[self rowForKey:@"gpsMinInterval" label:@"Min time between changes (s)" min:0 max:10]];
+    [_stack addArrangedSubview:[self gpsAccuracyOptionRow]];
+    [_stack addArrangedSubview:[self rowForKey:@"gpsMaxAccuracy" label:@"Accepted accuracy cutoff (m)" min:1 max:100]];
+    [_stack addArrangedSubview:[self section:@"Reported GPS values and offset"]];
+    [_stack addArrangedSubview:[self rowForKey:@"gpsAltitudeScale" label:@"Altitude scale (×)" min:0 max:2]];
+    [_stack addArrangedSubview:[self rowForKey:@"gpsAltitudeOffset" label:@"Altitude offset (m)" min:-100 max:100]];
+    [_stack addArrangedSubview:[self rowForKey:@"gpsHorizontalAccuracyScale" label:@"Horizontal accuracy (×)" min:0 max:5]];
+    [_stack addArrangedSubview:[self rowForKey:@"gpsVerticalAccuracyScale" label:@"Vertical accuracy (×)" min:0 max:5]];
+    [_stack addArrangedSubview:[self rowForKey:@"gpsReportedSpeedScale" label:@"Reported speed (×)" min:0 max:2]];
+    [_stack addArrangedSubview:[self rowForKey:@"gpsCourseOffset" label:@"Course offset (degrees)" min:-180 max:180]];
+    [_stack addArrangedSubview:[self rowForKey:@"gpsOffsetEast" label:@"Coordinate offset east (m)" min:-1000 max:1000]];
+    [_stack addArrangedSubview:[self rowForKey:@"gpsOffsetNorth" label:@"Coordinate offset north (m)" min:-1000 max:1000]];
+    UILabel *gpsHint=[UILabel new]; gpsHint.text=@"Smoothing 0 follows raw steps; larger positive values add lag and negative values amplify. Moving distance scale 1× keeps the filtered step, 0.5× halves all moving distance, 0 freezes, and negative reverses. The stationary radius holds small wandering; movement must exceed it and remain above the speed threshold for the confirmation time. Drift cap 0 means no stationary drift. Max step 0 and minimum interval 0 disable those limits. Accuracy filtering can hold poor fixes. Advanced rows alter reported GPS metadata or add a fixed east/north offset. These settings do not change Core Location callback frequency."; gpsHint.font=[UIFont systemFontOfSize:10]; gpsHint.textColor=[UIColor secondaryLabelColor]; gpsHint.numberOfLines=0; [_stack addArrangedSubview:gpsHint];
     _gpsLiveLabel=[UILabel new]; _gpsLiveLabel.font=[UIFont monospacedDigitSystemFontOfSize:9 weight:UIFontWeightRegular]; _gpsLiveLabel.textColor=[UIColor secondaryLabelColor]; _gpsLiveLabel.numberOfLines=0; _gpsLiveLabel.text=@"GPS check: waiting for Core Location reads"; [_stack addArrangedSubview:_gpsLiveLabel];
     [_stack addArrangedSubview:[self section:@"Usage privacy · best effort"]];
     UILabel *targetInfo=[UILabel new]; targetInfo.text=[NSString stringWithFormat:@"Settings target (detected from this injected app): %@",gAppBundleID.length?gAppBundleID:@"unknown bundle ID"]; targetInfo.font=[UIFont monospacedDigitSystemFontOfSize:9 weight:UIFontWeightRegular]; targetInfo.textColor=[UIColor secondaryLabelColor]; targetInfo.numberOfLines=0; [_stack addArrangedSubview:targetInfo];
@@ -887,6 +1218,7 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
 }
 - (void)masterToggle:(UISwitch*)s{ gAppEnabled=s.isOn; SBResetGPSFilter(); }
 - (void)gpsAdjustmentsToggle:(UISwitch*)s{ gGPSAdjustmentsEnabled=s.isOn; SBResetGPSFilter(); }
+- (void)gpsAccuracyToggle:(UISwitch*)s{ gGPSAccuracyFilterEnabled=s.isOn; SBResetGPSFilter(); }
 - (void)usageMaskToggle:(UISwitch*)s{ if(s.tag>=0 && s.tag<U_COUNT) gUsageMaskOption[s.tag]=s.isOn; }
 - (void)saveTap{
     gBtnOpacity=((UISlider*)_sliders[@"btnOpacity"]).value; gBtnSize=((UISlider*)_sliders[@"btnSize"]).value;
@@ -896,29 +1228,59 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     savePrefs();
     UIImpactFeedbackGenerator *g=[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium]; [g impactOccurred]; [self togglePanel];
 }
+- (double)defaultValueForKey:(NSString*)key{
+    if([key isEqualToString:@"gpsSmoothing"]) return 0.65;
+    if([key isEqualToString:@"gpsSpeed"]||[key isEqualToString:@"gpsAltitudeScale"]||[key isEqualToString:@"gpsHorizontalAccuracyScale"]||[key isEqualToString:@"gpsVerticalAccuracyScale"]||[key isEqualToString:@"gpsReportedSpeedScale"]) return 1.0;
+    if([key isEqualToString:@"gpsDeadband"]) return 10.0;
+    if([key isEqualToString:@"gpsStationaryDrift"]||[key isEqualToString:@"gpsMinInterval"]||[key isEqualToString:@"gpsAltitudeOffset"]||[key isEqualToString:@"gpsCourseOffset"]||[key isEqualToString:@"gpsOffsetEast"]||[key isEqualToString:@"gpsOffsetNorth"]) return 0.0;
+    if([key isEqualToString:@"gpsMoveConfirm"]) return 3.0;
+    if([key isEqualToString:@"gpsStationarySpeed"]) return 0.5;
+    if([key isEqualToString:@"gpsMaxStep"]) return 10.0;
+    if([key isEqualToString:@"gpsMaxAccuracy"]) return 50.0;
+    return 1.0;
+}
+- (void)restoreSliderBounds:(UISlider*)slider key:(NSString*)key{
+    if([key isEqualToString:@"gpsSmoothing"]){ slider.minimumValue=0; slider.maximumValue=0.95; }
+    else if([key isEqualToString:@"gpsSpeed"]){ slider.minimumValue=0; slider.maximumValue=1.5; }
+    else if([key isEqualToString:@"gpsDeadband"]){ slider.minimumValue=0; slider.maximumValue=50; }
+    else if([key isEqualToString:@"gpsStationaryDrift"]||[key isEqualToString:@"gpsMoveConfirm"]||[key isEqualToString:@"gpsMinInterval"]){ slider.minimumValue=0; slider.maximumValue=10; }
+    else if([key isEqualToString:@"gpsStationarySpeed"]){ slider.minimumValue=0; slider.maximumValue=2; }
+    else if([key isEqualToString:@"gpsMaxStep"]){ slider.minimumValue=0; slider.maximumValue=50; }
+    else if([key isEqualToString:@"gpsMaxAccuracy"]){ slider.minimumValue=1; slider.maximumValue=100; }
+    else if([key isEqualToString:@"gpsAltitudeScale"]){ slider.minimumValue=0; slider.maximumValue=2; }
+    else if([key isEqualToString:@"gpsAltitudeOffset"]){ slider.minimumValue=-100; slider.maximumValue=100; }
+    else if([key isEqualToString:@"gpsHorizontalAccuracyScale"]||[key isEqualToString:@"gpsVerticalAccuracyScale"]){ slider.minimumValue=0; slider.maximumValue=5; }
+    else if([key isEqualToString:@"gpsReportedSpeedScale"]){ slider.minimumValue=0; slider.maximumValue=2; }
+    else if([key isEqualToString:@"gpsCourseOffset"]){ slider.minimumValue=-180; slider.maximumValue=180; }
+    else if([key isEqualToString:@"gpsOffsetEast"]||[key isEqualToString:@"gpsOffsetNorth"]){ slider.minimumValue=-1000; slider.maximumValue=1000; }
+}
 - (void)resetTap{
     for(NSString *k in _sliders.allKeys){
         if([k isEqualToString:@"btnOpacity"]||[k isEqualToString:@"btnSize"]) continue;
-        float resetValue=[k isEqualToString:@"gpsSmoothing"]?0.65f:1.0f;
+        double resetValue=[self defaultValueForKey:k];
         UISlider *sl=(UISlider*)_sliders[k];
-        if([k isEqualToString:@"gpsSmoothing"]){ sl.minimumValue=0.0; sl.maximumValue=0.95; }
-        else if([k isEqualToString:@"gpsSpeed"]){ sl.minimumValue=0.1; sl.maximumValue=1.0; }
-        sl.value=resetValue; ((UILabel*)_valueLabels[k]).text=[NSString stringWithFormat:@"%.2f",resetValue];
+        if(SBIsGPSControlKey(k)) [self restoreSliderBounds:sl key:k];
+        sl.value=(float)resetValue; ((UILabel*)_valueLabels[k]).text=SBFormatSettingValue(k,resetValue);
         NSArray *keys=sensorKeys(); NSArray *ax=axisLetters(); BOOL isAxis=NO;
         for(int si=0;si<S_COUNT;si++) for(int a=0;a<3;a++) if([[keys[si] stringByAppendingString:ax[a]] isEqualToString:k]){ gAxis[si][a]=1; isAxis=YES; }
         if(!isAxis) [self setCur:resetValue key:k];
     }
     gAppEnabled=YES; _enabledSwitch.on=YES;
-    gGPSAdjustmentsEnabled=NO; _gpsAdjustmentsSwitch.on=NO; SBResetGPSFilter();
+    gGPSAdjustmentsEnabled=NO; _gpsAdjustmentsSwitch.on=NO;
+    gGPSAccuracyFilterEnabled=YES; _gpsAccuracySwitch.on=YES; SBResetGPSFilter();
     gUsageMaskOption[U_MASK]=NO; gUsageMaskOption[U_APP_STATE]=YES; gUsageMaskOption[U_SCENE_STATE]=YES;
     gUsageMaskOption[U_PROTECTED_DATA]=YES; gUsageMaskOption[U_SCREEN_BRIGHTNESS]=NO; gUsageMaskOption[U_LIFECYCLE_NOTIFICATIONS]=NO;
     for(int i=0;i<U_COUNT;i++){ UISwitch *usageSwitch=(UISwitch*)_usageSwitches[[NSString stringWithFormat:@"%d",i]]; usageSwitch.on=gUsageMaskOption[i]; }
     savePrefs();
 }
-- (void)hideFloat{ _floatWindow.hidden=YES; _panelWindow.hidden=YES; }
+- (void)hideFloat{
+    _panelWindow.hidden=YES; _floatWindow.hidden=YES;
+    if(_previousKeyWindow && !_previousKeyWindow.hidden) [_previousKeyWindow makeKeyWindow];
+}
 - (void)refreshUI{
     _enabledSwitch.on=gAppEnabled;
     _gpsAdjustmentsSwitch.on=gGPSAdjustmentsEnabled;
+    _gpsAccuracySwitch.on=gGPSAccuracyFilterEnabled;
     for(int i=0;i<U_COUNT;i++){ UISwitch *usageSwitch=(UISwitch*)_usageSwitches[[NSString stringWithFormat:@"%d",i]]; usageSwitch.on=gUsageMaskOption[i]; }
     for(NSString *k in _sliders.allKeys){
         double v=[self cur:k]; NSArray *keys=sensorKeys(); NSArray *ax=axisLetters();
@@ -963,6 +1325,7 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
             double east=0,north=0; SBMetersBetweenCoordinates(raw,adjusted,&east,&north);
             _gpsLiveLabel.text=[NSString stringWithFormat:@"GPS check: %lu reads · %lu adjusted fixes\nRaw: %.6f, %.6f\nOutput: %.6f, %.6f · Δ %.1f m",(unsigned long)reads,(unsigned long)fixes,raw.latitude,raw.longitude,adjusted.latitude,adjusted.longitude,hypot(east,north)];
         }
+        if(gGPSAdjustmentsEnabled) _gpsLiveLabel.text=[_gpsLiveLabel.text stringByAppendingFormat:@"\nFilter: %@ · raw radius %.1f m · poor fixes held %lu",gGPSIsStationary?@"stationary":@"moving",gGPSStationaryRawDistance,(unsigned long)gGPSAccuracyRejectedCount];
     }
 }
 @end

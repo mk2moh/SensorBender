@@ -1,12 +1,31 @@
-# SensorBender v1.9.0
+# SensorBender v1.10.0
 
 A single standalone TrollFools dylib for app-scoped CoreMotion and CoreLocation testing. There is no jailbreak `.deb`, Settings bundle, HealthKit, Steps, or Distance code.
 
-**v1.9.0** adds optional, best-effort app-usage state masking to the in-dylib panel. The v1.8.1 ARC-safe runtime-class enumeration fix remains in the source, but this update has not been compiled or tested on a device in this workspace.
+**v1.10.0** adds metre/time-based GPS stability controls, optional reported-location-field transforms, and best-effort floating-panel collision handling for apps that have more than one injected overlay. The v1.9.0 source features remain. This update has not been compiled or device-tested in this workspace.
 
 ## Per-app targeting
 
 The injected process is detected automatically from its own bundle identifier (`NSBundle.mainBundle.bundleIdentifier`). The panel displays that identifier, and settings are stored under that app's existing per-app preferences. Inject SensorBender into each app you want to configure. The dylib does not enumerate every unrelated running app; that is not a normal public iOS capability for an injected app.
+
+## GPS controls
+
+GPS adjustments are off by default. Enable **GPS adjustments** for the target app and save before testing. The path controls are independent of accelerometer scaling.
+
+- **Smoothing response:** `0` follows incoming movement without smoothing. Positive values add velocity-filter memory and lag; the filter's time constant is approximately `0.05 + 4 × value` seconds. Negative values amplify changes. This is not a GPS callback-rate control.
+- **Moving distance scale:** multiplies each filtered path step. `1×` keeps the full step, `0.5×` halves all moving distance, `0` holds the output, values above `1` amplify movement, and negative values reverse the path.
+- **Stationary radius (m):** the raw coordinate must leave this net-displacement radius and exceed the moving-speed threshold for the confirmation period before the output switches to moving. Default: `10 m`.
+- **Stationary drift cap (m/min):** caps movement caused by residual stationary wander. `0` means no output drift while classified stationary.
+- **Movement confirmation (s)** and **moving threshold (m/s):** require candidate movement to persist and exceed a speed threshold. The defaults are `3 s` and `0.5 m/s`.
+- **Max output step (m):** caps an applied coordinate change. `0` disables the cap; default: `10 m`. Unapplied movement is carried forward.
+- **Min time between changes (s):** holds intermediate coordinate results and applies pending movement on the next fix at or after the selected interval. `0` disables throttling. This does not reduce Core Location callback frequency.
+- **Accuracy-aware filtering:** enabled by default; it holds fixes whose reported horizontal accuracy is worse than the cutoff and, when smoothing is non-negative, smooths accepted lower-confidence fixes more strongly. Default cutoff: `50 m`.
+
+Advanced **Reported GPS values and offset** controls transform altitude, horizontal/vertical accuracy, reported speed, and course, or add a fixed east/north coordinate offset in metres. These affect fields returned to the injected app; they do not change the device's actual GPS hardware or every possible location API.
+
+Tap a displayed GPS value to enter any finite number, including numbers outside the slider range. The numeric value is retained while the slider stays at an endpoint when necessary. Threshold-like values use their absolute magnitude; offsets can be negative; negative movement scale reverses direction; negative smoothing amplifies changes. Extreme values can cause nonsensical location results, so use small test values.
+
+The live diagnostic shows hooked coordinate reads, adjusted fixes, raw/output coordinates, stationary/moving classification, raw distance from the stationary anchor, and rejected poor-accuracy fixes. If Google Maps moves while the hooked-read counter stays at zero, these adjustments are not reaching the getter path being monitored; that diagnostic does not establish why.
 
 ## Usage privacy controls
 
@@ -18,28 +37,18 @@ The **Usage privacy · best effort** section is separate from all sensor and GPS
 - **Screen brightness reports 100%** — changes the brightness getter result only; it does not turn on the physical display or change the lock state.
 - **Suppress background notifications** — suppresses selected public `NSNotificationCenter` background, scene-deactivation, protected-data, and brightness-change broadcasts.
 
-The app/scene state hooks are independent of the existing CoreMotion, barometer, and GPS hooks. Turning usage masking on does not disable or alter accelerometer, gyroscope, magnetometer/compass, attitude, or location spoofing. The separate **Enable for this app** switch still gates the app's spoofing controls.
+These masks cannot stop iOS from suspending the process, suppress every lifecycle delegate callback, or prevent private APIs and other signals from revealing that the app is no longer visible. Notification suppression can affect app code that relies on those broadcasts; leave it off unless you specifically want to test it.
 
-These are property/notification masks, not a way to keep an iOS process alive. iOS may suspend the app, lifecycle delegate callbacks can still reveal the transition, and private APIs or other signals may expose that it is no longer visible. Notification suppression can also affect app code that relies on those broadcasts; leave that option off unless you specifically want to test it. A successful build/runtime result is not claimed here.
+## Multiple injected overlays
 
-## Sensor and location controls
+The floating SensorBender button now searches for an available spot among visible small windows, avoids making the floating button key by default, raises its panel only while open, restores the previous key window when closed, and avoids auto-opening over another visible full-screen overlay. This is best-effort coordination: other injected dylibs may use different window/touch handling, so real-device testing is still needed.
 
-The in-app panel has per-app scalar and per-axis controls for accelerometer, gyroscope, magnetometer/compass, user acceleration, gravity, rotation rate, calibrated magnetometer, and attitude, plus barometer and location controls. Usage-state options do not change these settings.
+## Sensors and interface
 
-GPS adjustments start off. Enable **GPS adjustments** for the app, then use **Jitter smoothing** and **GPS speed scale**. GPS values are not clamped to the slider endpoints: tap either displayed number to enter any finite number, including `-100`; normal values expand the slider range as needed. For values beyond UISlider's float range, the exact typed value remains displayed and saved while the slider thumb stays at an endpoint. The slider's original range is only a quick-adjustment range.
-
-Smoothing `0` passes movement through. Positive values increase filter memory; negative values amplify incoming velocity changes and can make jitter much worse. Speed scale multiplies the adjusted path: `0` pauses it, negative values reverse it, and values above `1` speed it up. These GPS controls are independent from acceleration scaling. Extreme values can produce very large or invalid movement, so start with small changes.
-
-The GPS section displays live Core Location getter reads, adjusted-fix count, and raw-versus-output coordinates. In Google Maps, enable GPS adjustments, save, move around, then reopen the panel to check whether the read/fix counters and output coordinates change. If the read counter remains at zero while the map's blue dot updates, the app is not reaching a hooked `CLLocation.coordinate` getter; this diagnostic does not establish why. The hook also scans Core Location subclasses for coordinate overrides. No runtime cause has been confirmed without a device test.
-
-Historical or out-of-order fixes pass through unchanged; timestamps, accuracy, and altitude are not rewritten.
-
-## Interface
-
-The panel uses native iOS system colors and typography, with a flat accent color and grouped controls. It follows light/dark mode and uses no gradients. The menu opens when the injected app launches; tap the floating **SB** button to reopen it. Use **Save changes** to persist settings.
+The panel retains per-app scalar and per-axis controls for accelerometer, gyroscope, magnetometer/compass, user acceleration, gravity, rotation rate, calibrated magnetometer, and attitude, plus barometer controls. The panel uses native iOS system colors and typography, a flat accent color, and grouped controls; it follows light/dark mode and uses no gradients.
 
 ## Build
 
-GitHub Actions builds one `SensorBender-v<version>.dylib` and uploads it directly and inside `SensorBender-v<version>.zip`. Push the source, then download the artifact from **Build SensorBender standalone dylib**. This workspace cannot run the GitHub workflow or compile against an iOS SDK, so the v1.8.1 ARC fix and the new v1.9.0 hooks still require CI/build and device verification. The dylib uses Logos' internal generator and has no linked tweak-hook runtime dependency.
+GitHub Actions builds one `SensorBender-v<version>.dylib` and uploads it directly and inside `SensorBender-v<version>.zip`. Push the source, then download the artifact from **Build SensorBender standalone dylib**. This workspace cannot run the GitHub workflow or compile against an iOS SDK, so the v1.10.0 GPS state machine, overlay changes, and the carried-forward v1.8.1 ARC fix all still require CI/build and device verification. The dylib uses Logos' internal generator and has no linked tweak-hook runtime dependency.
 
-Main sensor sliders cover `-100` to `100`, per-axis sliders `-5` to `5`, and typed sensor values `-1000` to `1000`. The GPS sliders initially cover smoothing `0` to `0.95` and speed scale `0.1×` to `1.0×`; tapping the GPS numbers expands them beyond those ranges.
+Main sensor sliders cover `-100` to `100`, per-axis sliders `-5` to `5`, and typed sensor values `-1000` to `1000`. Slider ranges are quick-adjustment ranges; GPS controls also support finite typed values outside them.
