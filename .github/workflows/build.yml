@@ -62,8 +62,9 @@ jobs:
 
           SensorBender-v${SENSOR_BENDER_VERSION}.dylib
             Inject into an app you own or are authorized to test. The in-app
-            panel includes CoreMotion multipliers and optional GPS smoothing
-            and speed scaling. Steps/Distance/HealthKit hooks are not included.
+            panel includes CoreMotion multipliers, optional GPS adjustment,
+            and best-effort app-usage state masking. Steps/Distance/HealthKit
+            hooks are not included; usage masking cannot prevent iOS suspension.
           EOF
           (cd release && zip -q -j "../SensorBender-v${SENSOR_BENDER_VERSION}.zip" \
             "SensorBender-v${SENSOR_BENDER_VERSION}.dylib" README.txt)
