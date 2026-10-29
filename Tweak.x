@@ -30,19 +30,19 @@ static NSUserDefaults *prefsDB(){ return [NSUserDefaults standardUserDefaults]; 
 static double readD(id source, NSString *k, double def){ id v=[source objectForKey:k]; return v?[v doubleValue]:def; }
 static BOOL readB(id source, NSString *k, BOOL def){ id v=[source objectForKey:k]; return v?[v boolValue]:def; }
 static inline double M(int s, int a){ return gSensorAdv[s] ? gAxis[s][a] : gBase[s]; }
-static BOOL MSShouldShowOverlay(void){ return NSBundle.mainBundle.bundleIdentifier.length > 0; }
+static BOOL SBShouldShowOverlay(void){ return NSBundle.mainBundle.bundleIdentifier.length > 0; }
 
 // Keep compass headings consistent with the per-axis magnetometer multipliers.
-static __thread BOOL gMSRawCompassAxes=NO;
-static double MSSpoofCompassHeading(CLHeading *heading, double originalHeading){
+static __thread BOOL gSBRawCompassAxes=NO;
+static double SBSpoofCompassHeading(CLHeading *heading, double originalHeading){
     if(!heading || !gEnabled || !gAppEnabled || !gSensorEnabled[S_MAG] || originalHeading<0) return originalHeading;
     double rawX=0, rawY=0;
-    gMSRawCompassAxes=YES;
+    gSBRawCompassAxes=YES;
     @try {
         rawX=heading.x;
         rawY=heading.y;
     } @finally {
-        gMSRawCompassAxes=NO;
+        gSBRawCompassAxes=NO;
     }
     if(!isfinite(rawX) || !isfinite(rawY) || hypot(rawX,rawY)<1e-9) return originalHeading;
     double mx=M(S_MAG,0), my=M(S_MAG,1);
@@ -69,7 +69,7 @@ static BOOL gGPSHasCourse = NO;
 static NSUInteger gGPSFilterGeneration = 0;
 static char gGPSAdjustmentAssociationKey;
 
-static void MSResetGPSFilter(void){
+static void SBResetGPSFilter(void){
     @synchronized([CLLocation class]) {
         gGPSFilterInitialized = NO;
         gGPSHasFilteredVelocity = NO;
@@ -79,7 +79,7 @@ static void MSResetGPSFilter(void){
     }
 }
 
-static CLLocationCoordinate2D MSCoordinateByAddingMeters(CLLocationCoordinate2D origin, double east, double north){
+static CLLocationCoordinate2D SBCoordinateByAddingMeters(CLLocationCoordinate2D origin, double east, double north){
     const double earthRadius = 6371000.0;
     double latRadians = origin.latitude * M_PI / 180.0;
     double cosine = cos(latRadians);
@@ -92,7 +92,7 @@ static CLLocationCoordinate2D MSCoordinateByAddingMeters(CLLocationCoordinate2D 
     return CLLocationCoordinate2DIsValid(result) ? result : origin;
 }
 
-static void MSMetersBetweenCoordinates(CLLocationCoordinate2D from, CLLocationCoordinate2D to, double *east, double *north){
+static void SBMetersBetweenCoordinates(CLLocationCoordinate2D from, CLLocationCoordinate2D to, double *east, double *north){
     const double earthRadius = 6371000.0;
     double deltaLongitude = to.longitude - from.longitude;
     if (deltaLongitude > 180.0) deltaLongitude -= 360.0;
@@ -102,7 +102,7 @@ static void MSMetersBetweenCoordinates(CLLocationCoordinate2D from, CLLocationCo
     *north = (to.latitude - from.latitude) * M_PI / 180.0 * earthRadius;
 }
 
-static NSDictionary *MSGPSAdjustmentForLocation(CLLocation *location, CLLocationCoordinate2D rawCoordinate){
+static NSDictionary *SBGPSAdjustmentForLocation(CLLocation *location, CLLocationCoordinate2D rawCoordinate){
     if (!gEnabled || !gAppEnabled || !gGPSAdjustmentsEnabled || !CLLocationCoordinate2DIsValid(rawCoordinate)) return nil;
     @synchronized([CLLocation class]) {
         NSDictionary *cached = objc_getAssociatedObject(location, &gGPSAdjustmentAssociationKey);
@@ -144,7 +144,7 @@ static NSDictionary *MSGPSAdjustmentForLocation(CLLocation *location, CLLocation
                 adjustedCourse = gGPSPreviousCourse;
             } else {
                 double east = 0, north = 0;
-                MSMetersBetweenCoordinates(gGPSLastRawCoordinate, rawCoordinate, &east, &north);
+                SBMetersBetweenCoordinates(gGPSLastRawCoordinate, rawCoordinate, &east, &north);
                 double rawDistance = hypot(east, north);
                 double maxPlausibleJump = 40.0 + 70.0 * dt + 2.0 * (accuracy + gGPSLastAccuracy);
                 if (!isfinite(rawDistance) || rawDistance > maxPlausibleJump) {
@@ -175,7 +175,7 @@ static NSDictionary *MSGPSAdjustmentForLocation(CLLocation *location, CLLocation
                     double speedScale = fmax(0.1, fmin(1.0, gGPSSpeedMultiplier));
                     double stepEast = gGPSFilteredEastVelocity * dt * speedScale;
                     double stepNorth = gGPSFilteredNorthVelocity * dt * speedScale;
-                    adjusted = MSCoordinateByAddingMeters(gGPSSpoofCoordinate, stepEast, stepNorth);
+                    adjusted = SBCoordinateByAddingMeters(gGPSSpoofCoordinate, stepEast, stepNorth);
                     double adjustedDistance = hypot(stepEast, stepNorth);
                     adjustedSpeed = adjustedDistance / dt;
                     hasSpeed = YES;
@@ -264,7 +264,7 @@ static void savePrefs(void){
     if(doc){
         NSMutableDictionary *export=[app mutableCopy];
         export[@"bundleIdentifier"]=gAppBundleID;
-        NSString *p=[doc stringByAppendingPathComponent:@"MotionSpoofer.json"];
+        NSString *p=[doc stringByAppendingPathComponent:@"SensorBender.json"];
         NSData *j=[NSJSONSerialization dataWithJSONObject:export options:NSJSONWritingPrettyPrinted error:nil]; [j writeToFile:p atomically:YES];
     }
 }
@@ -297,22 +297,22 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
 %end
 
 %hook CLHeading
-- (CLLocationDirection)x{ CLLocationDirection v=%orig; if(!gMSRawCompassAxes && gEnabled && gAppEnabled && gSensorEnabled[S_MAG]) v*=M(S_MAG,0); return v; }
-- (CLLocationDirection)y{ CLLocationDirection v=%orig; if(!gMSRawCompassAxes && gEnabled && gAppEnabled && gSensorEnabled[S_MAG]) v*=M(S_MAG,1); return v; }
-- (CLLocationDirection)z{ CLLocationDirection v=%orig; if(!gMSRawCompassAxes && gEnabled && gAppEnabled && gSensorEnabled[S_MAG]) v*=M(S_MAG,2); return v; }
+- (CLLocationDirection)x{ CLLocationDirection v=%orig; if(!gSBRawCompassAxes && gEnabled && gAppEnabled && gSensorEnabled[S_MAG]) v*=M(S_MAG,0); return v; }
+- (CLLocationDirection)y{ CLLocationDirection v=%orig; if(!gSBRawCompassAxes && gEnabled && gAppEnabled && gSensorEnabled[S_MAG]) v*=M(S_MAG,1); return v; }
+- (CLLocationDirection)z{ CLLocationDirection v=%orig; if(!gSBRawCompassAxes && gEnabled && gAppEnabled && gSensorEnabled[S_MAG]) v*=M(S_MAG,2); return v; }
 - (CLLocationDirection)magneticHeading{
     CLLocationDirection real=%orig;
-    CLLocationDirection spoof=MSSpoofCompassHeading(self,real);
+    CLLocationDirection spoof=SBSpoofCompassHeading(self,real);
     lastCompassHeading=real; lastCompassHeadingSpoof=spoof;
     return spoof;
 }
-- (CLLocationDirection)trueHeading{ CLLocationDirection real=%orig; return MSSpoofCompassHeading(self,real); }
+- (CLLocationDirection)trueHeading{ CLLocationDirection real=%orig; return SBSpoofCompassHeading(self,real); }
 %end
 
 %hook CLLocation
 - (CLLocationCoordinate2D)coordinate{
     CLLocationCoordinate2D raw=%orig;
-    NSDictionary *adjusted=MSGPSAdjustmentForLocation(self,raw);
+    NSDictionary *adjusted=SBGPSAdjustmentForLocation(self,raw);
     if(!adjusted) return raw;
     return CLLocationCoordinate2DMake([adjusted[@"latitude"] doubleValue],[adjusted[@"longitude"] doubleValue]);
 }
@@ -359,8 +359,8 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
 %end
 
 // PassThrough view to fix touch bug
-@interface MSPassThroughView : UIView @end
-@implementation MSPassThroughView
+@interface SBPassThroughView : UIView @end
+@implementation SBPassThroughView
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event{
     for(UIView *v in self.subviews){
         if(!v.hidden && v.alpha>0.01 && v.userInteractionEnabled && [v pointInside:[self convertPoint:point toView:v] withEvent:event]) return YES;
@@ -379,13 +379,13 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
 }
 @end
 
-@interface MSMotionOverlay : NSObject
+@interface SBSensorBenderOverlay : NSObject
 + (instancetype)shared; - (void)installIfNeeded; - (void)reconcileVisibility; - (void)togglePanel; - (void)createWindow; - (void)scheduleAutoOpenPanel;
 @end
 
-@implementation MSMotionOverlay {
+@implementation SBSensorBenderOverlay {
     UIWindow *_floatWindow; UIWindow *_panelWindow;
-    MSPassThroughView *_rootView; MSPassThroughView *_panelRootView;
+    SBPassThroughView *_rootView; SBPassThroughView *_panelRootView;
     UIButton *_floatBtn; UIView *_panelBG; UIView *_card; UIScrollView *_scroll; UIStackView *_stack;
     NSMutableDictionary *_sliders; NSMutableDictionary *_valueLabels; NSMutableDictionary *_liveLabels;
     NSMutableDictionary *_sensorHeaders; NSMutableDictionary *_absRows; NSMutableDictionary *_advContainers;
@@ -394,12 +394,12 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     BOOL _didAutoOpenPanel; BOOL _autoOpenScheduled;
     CGPoint _panStart;
 }
-+ (instancetype)shared{ static MSMotionOverlay *s; static dispatch_once_t t; dispatch_once(&t,^{s=[MSMotionOverlay new];}); return s; }
++ (instancetype)shared{ static SBSensorBenderOverlay *s; static dispatch_once_t t; dispatch_once(&t,^{s=[SBSensorBenderOverlay new];}); return s; }
 - (void)installIfNeeded{
-    if(!MSShouldShowOverlay() || [UIApplication sharedApplication].applicationState==UIApplicationStateBackground) return;
+    if(!SBShouldShowOverlay() || [UIApplication sharedApplication].applicationState==UIApplicationStateBackground) return;
     if(_floatWindow){
         dispatch_async(dispatch_get_main_queue(),^{
-            if(MSShouldShowOverlay() && [UIApplication sharedApplication].applicationState!=UIApplicationStateBackground){
+            if(SBShouldShowOverlay() && [UIApplication sharedApplication].applicationState!=UIApplicationStateBackground){
                 self->_floatWindow.hidden=NO;
                 [self scheduleAutoOpenPanel];
             }
@@ -407,12 +407,12 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
         return;
     }
     dispatch_async(dispatch_get_main_queue(),^{
-        if(MSShouldShowOverlay() && [UIApplication sharedApplication].applicationState!=UIApplicationStateBackground && !self->_floatWindow) [self createWindow];
-        else if(MSShouldShowOverlay() && self->_floatWindow) [self scheduleAutoOpenPanel];
+        if(SBShouldShowOverlay() && [UIApplication sharedApplication].applicationState!=UIApplicationStateBackground && !self->_floatWindow) [self createWindow];
+        else if(SBShouldShowOverlay() && self->_floatWindow) [self scheduleAutoOpenPanel];
     });
 }
 - (void)reconcileVisibility{
-    if(MSShouldShowOverlay() && [UIApplication sharedApplication].applicationState!=UIApplicationStateBackground) [self installIfNeeded];
+    if(SBShouldShowOverlay() && [UIApplication sharedApplication].applicationState!=UIApplicationStateBackground) [self installIfNeeded];
     else dispatch_async(dispatch_get_main_queue(),^{ self->_panelWindow.hidden=YES; self->_floatWindow.hidden=YES; });
 }
 - (void)scheduleAutoOpenPanel{
@@ -420,7 +420,7 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     _autoOpenScheduled=YES;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(0.45*NSEC_PER_SEC)),dispatch_get_main_queue(),^{
         self->_autoOpenScheduled=NO;
-        if(self->_didAutoOpenPanel || !MSShouldShowOverlay() || [UIApplication sharedApplication].applicationState!=UIApplicationStateActive || !self->_panelWindow) return;
+        if(self->_didAutoOpenPanel || !SBShouldShowOverlay() || [UIApplication sharedApplication].applicationState!=UIApplicationStateActive || !self->_panelWindow) return;
         self->_didAutoOpenPanel=YES;
         if(self->_panelWindow.hidden) [self togglePanel];
     });
@@ -435,7 +435,7 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     return fallback;
 }
 - (void)createWindow{
-    if(!MSShouldShowOverlay() || [UIApplication sharedApplication].applicationState==UIApplicationStateBackground) return;
+    if(!SBShouldShowOverlay() || [UIApplication sharedApplication].applicationState==UIApplicationStateBackground) return;
     UIWindowScene *scene=[self findWindowScene];
     CGRect floatFrame=CGRectMake(20,90,gBtnSize,gBtnSize);
     // Float window - tiny, only button area, never blocks app
@@ -449,15 +449,16 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     _floatWindow.frame=floatFrame; _floatWindow.windowLevel=UIWindowLevelAlert+100;
     _floatWindow.backgroundColor=[UIColor clearColor]; _floatWindow.hidden=NO; _floatWindow.userInteractionEnabled=YES;
     UIViewController *vc1=[UIViewController new]; vc1.view.backgroundColor=[UIColor clearColor];
-    _rootView=[MSPassThroughView new]; _rootView.frame=CGRectMake(0,0,floatFrame.size.width,floatFrame.size.height); _rootView.backgroundColor=[UIColor clearColor];
+    _rootView=[SBPassThroughView new]; _rootView.frame=CGRectMake(0,0,floatFrame.size.width,floatFrame.size.height); _rootView.backgroundColor=[UIColor clearColor];
     vc1.view=_rootView;
     _floatWindow.rootViewController=vc1; [_floatWindow makeKeyAndVisible];
 
     _floatBtn=[UIButton buttonWithType:UIButtonTypeCustom];
     _floatBtn.frame=CGRectMake(0,0,gBtnSize,gBtnSize); _floatBtn.layer.cornerRadius=gBtnSize/2;
-    _floatBtn.backgroundColor=[UIColor colorWithRed:0.12 green:0.65 blue:0.95 alpha:gBtnOpacity];
-    _floatBtn.layer.shadowColor=[UIColor blackColor].CGColor; _floatBtn.layer.shadowOpacity=0.3; _floatBtn.layer.shadowRadius=6; _floatBtn.layer.shadowOffset=CGSizeMake(0,3);
-    [_floatBtn setTitle:@"SB" forState:UIControlStateNormal]; _floatBtn.titleLabel.font=[UIFont boldSystemFontOfSize:15];
+    _floatBtn.backgroundColor=[UIColor systemBlueColor]; _floatBtn.alpha=gBtnOpacity;
+    _floatBtn.layer.shadowColor=[UIColor blackColor].CGColor; _floatBtn.layer.shadowOpacity=0.12; _floatBtn.layer.shadowRadius=3; _floatBtn.layer.shadowOffset=CGSizeMake(0,1);
+    [_floatBtn setTitle:@"SB" forState:UIControlStateNormal]; [_floatBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal]; _floatBtn.titleLabel.font=[UIFont boldSystemFontOfSize:15];
+    _floatBtn.accessibilityLabel=@"SensorBender controls";
     [_floatBtn addTarget:self action:@selector(togglePanel) forControlEvents:UIControlEventTouchUpInside];
     UIPanGestureRecognizer *pan=[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
     [_floatBtn addGestureRecognizer:pan];
@@ -466,18 +467,18 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     // Panel window - full screen but hidden until opened
     _panelWindow.windowLevel=UIWindowLevelAlert+101; _panelWindow.backgroundColor=[UIColor clearColor]; _panelWindow.hidden=YES;
     UIViewController *vc2=[UIViewController new]; vc2.view.backgroundColor=[UIColor clearColor];
-    _panelRootView=[MSPassThroughView new]; _panelRootView.frame=[UIScreen mainScreen].bounds; _panelRootView.backgroundColor=[UIColor clearColor];
+    _panelRootView=[SBPassThroughView new]; _panelRootView.frame=[UIScreen mainScreen].bounds; _panelRootView.backgroundColor=[UIColor clearColor];
     vc2.view=_panelRootView;
     _panelWindow.rootViewController=vc2;
 
     _panelBG=[[UIView alloc] initWithFrame:_panelRootView.bounds];
     _panelBG.autoresizingMask=UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
-    _panelBG.backgroundColor=[UIColor colorWithWhite:0 alpha:0.48]; _panelBG.hidden=NO;
+    _panelBG.backgroundColor=[UIColor colorWithWhite:0 alpha:0.38]; _panelBG.hidden=NO;
     UITapGestureRecognizer *tapBG=[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(togglePanel)];
     [_panelBG addGestureRecognizer:tapBG];
     [_panelRootView addSubview:_panelBG];
 
-    _card=[[UIView alloc] init]; _card.backgroundColor=[UIColor systemBackgroundColor]; _card.layer.cornerRadius=18; _card.layer.masksToBounds=YES; _card.translatesAutoresizingMaskIntoConstraints=NO;
+    _card=[[UIView alloc] init]; _card.backgroundColor=[UIColor systemGroupedBackgroundColor]; _card.layer.cornerRadius=15; _card.layer.borderWidth=0.5; _card.layer.borderColor=[UIColor separatorColor].CGColor; _card.layer.masksToBounds=YES; _card.translatesAutoresizingMaskIntoConstraints=NO;
     [_panelBG addSubview:_card];
     [NSLayoutConstraint activateConstraints:@[
         [_card.centerXAnchor constraintEqualToAnchor:_panelBG.centerXAnchor],
@@ -493,7 +494,7 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
         [_scroll.trailingAnchor constraintEqualToAnchor:_card.trailingAnchor constant:-12],
         [_scroll.bottomAnchor constraintEqualToAnchor:_card.bottomAnchor constant:-12]
     ]];
-    _stack=[[UIStackView alloc] init]; _stack.axis=UILayoutConstraintAxisVertical; _stack.spacing=10; _stack.translatesAutoresizingMaskIntoConstraints=NO;
+    _stack=[[UIStackView alloc] init]; _stack.axis=UILayoutConstraintAxisVertical; _stack.spacing=12; _stack.translatesAutoresizingMaskIntoConstraints=NO;
     [_scroll addSubview:_stack];
     [NSLayoutConstraint activateConstraints:@[
         [_stack.topAnchor constraintEqualToAnchor:_scroll.contentLayoutGuide.topAnchor],
@@ -517,8 +518,8 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
         [UIView animateWithDuration:0.25 animations:^{ self->_floatWindow.center=CGPointMake(tx, self->_floatWindow.center.y); }];
     }
 }
-- (void)togglePanel{ BOOL show=_panelWindow.hidden; if(show){ [self refreshUI]; _panelWindow.hidden=NO; [_panelWindow makeKeyAndVisible]; } else { _panelWindow.hidden=YES; [_floatWindow makeKeyAndVisible]; } _floatBtn.alpha=show?0.3:1.0; }
-- (UILabel*)section:(NSString*)t{ UILabel *l=[UILabel new]; l.text=t; l.font=[UIFont boldSystemFontOfSize:11]; l.textColor=[UIColor secondaryLabelColor]; l.numberOfLines=0; return l; }
+- (void)togglePanel{ BOOL show=_panelWindow.hidden; if(show){ [self refreshUI]; _panelWindow.hidden=NO; [_panelWindow makeKeyAndVisible]; } else { _panelWindow.hidden=YES; [_floatWindow makeKeyAndVisible]; } _floatBtn.alpha=show?MIN(gBtnOpacity,0.35):gBtnOpacity; }
+- (UILabel*)section:(NSString*)t{ UILabel *l=[UILabel new]; l.text=t; l.font=[UIFont systemFontOfSize:13 weight:UIFontWeightSemibold]; l.textColor=[UIColor secondaryLabelColor]; l.numberOfLines=0; return l; }
 - (UIView*)rowForKey:(NSString*)key label:(NSString*)lab min:(float)mn max:(float)mx{
     UIView *row=[UIView new];
     UILabel *ttl=[UILabel new]; ttl.text=lab; ttl.font=[UIFont systemFontOfSize:13 weight:UIFontWeightMedium]; ttl.translatesAutoresizingMaskIntoConstraints=NO; [ttl.widthAnchor constraintEqualToConstant:118].active=YES;
@@ -533,13 +534,10 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     NSArray *keys=sensorKeys(); NSString *base=keys[idx]; NSArray *ax=axisLetters(); NSString *letter=ax[aIdx];
     NSString *key=[base stringByAppendingString:letter];
     UIView *row=[UIView new]; UILabel *ttl=[UILabel new]; ttl.translatesAutoresizingMaskIntoConstraints=NO; [ttl.widthAnchor constraintEqualToConstant:118].active=YES;
-    NSMutableAttributedString *at=[[NSMutableAttributedString alloc] initWithString:[sensorName uppercaseString] attributes:@{NSFontAttributeName:[UIFont systemFontOfSize:8], NSForegroundColorAttributeName:[UIColor secondaryLabelColor]}];
-    UIColor *c=aIdx==0?[UIColor systemRedColor]:aIdx==1?[UIColor systemGreenColor]:[UIColor systemBlueColor];
     NSString *dispName=[sensorName isEqualToString:@"Attitude"] ? (@[@"Roll",@"Pitch",@"Yaw"][aIdx]) : letter;
-    NSAttributedString *let=[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"  %@",dispName] attributes:@{NSFontAttributeName:[UIFont boldSystemFontOfSize:13], NSForegroundColorAttributeName:c}];
-    [at appendAttributedString:let]; ttl.attributedText=at;
-    UISlider *sl=[UISlider new]; sl.minimumValue=-5; sl.maximumValue=5; sl.value=(float)gAxis[idx][aIdx]; sl.accessibilityIdentifier=key; sl.minimumTrackTintColor=c; [sl addTarget:self action:@selector(axisChanged:) forControlEvents:UIControlEventValueChanged];
-    UILabel *val=[UILabel new]; val.font=[UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightMedium]; val.textColor=c; val.text=[NSString stringWithFormat:@"%.2f",sl.value]; val.translatesAutoresizingMaskIntoConstraints=NO; [val.widthAnchor constraintEqualToConstant:52].active=YES; val.textAlignment=NSTextAlignmentRight; val.userInteractionEnabled=YES; UITapGestureRecognizer *tap=[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tapValue:)]; [val addGestureRecognizer:tap]; val.accessibilityIdentifier=key;
+    ttl.text=dispName; ttl.font=[UIFont systemFontOfSize:13 weight:UIFontWeightMedium]; ttl.textColor=[UIColor secondaryLabelColor];
+    UISlider *sl=[UISlider new]; sl.minimumValue=-5; sl.maximumValue=5; sl.value=(float)gAxis[idx][aIdx]; sl.accessibilityIdentifier=key; sl.minimumTrackTintColor=[UIColor systemBlueColor]; [sl addTarget:self action:@selector(axisChanged:) forControlEvents:UIControlEventValueChanged];
+    UILabel *val=[UILabel new]; val.font=[UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightMedium]; val.textColor=[UIColor systemBlueColor]; val.text=[NSString stringWithFormat:@"%.2f",sl.value]; val.translatesAutoresizingMaskIntoConstraints=NO; [val.widthAnchor constraintEqualToConstant:52].active=YES; val.textAlignment=NSTextAlignmentRight; val.userInteractionEnabled=YES; UITapGestureRecognizer *tap=[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tapValue:)]; [val addGestureRecognizer:tap]; val.accessibilityIdentifier=key;
     _sliders[key]=sl; _valueLabels[key]=val;
     // live label for axis
     UILabel *live=[UILabel new]; live.font=[UIFont systemFontOfSize:9]; live.textColor=[UIColor tertiaryLabelColor]; live.tag=1000+aIdx;
@@ -592,9 +590,9 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
 }
 - (UIView*)sensorSectionForIdx:(int)idx{
     NSString *label=sensorLabels()[idx]; NSString *key=sensorKeys()[idx];
-    UIView *sec=[UIView new]; sec.layer.cornerRadius=10; sec.backgroundColor=[UIColor secondarySystemBackgroundColor]; sec.layer.masksToBounds=YES;
-    // header
-    UIView *header=[UIView new]; header.backgroundColor=[UIColor tertiarySystemFillColor];
+    UIView *sec=[UIView new]; sec.layer.cornerRadius=10; sec.backgroundColor=[UIColor secondarySystemGroupedBackgroundColor]; sec.layer.borderWidth=0.5; sec.layer.borderColor=[UIColor separatorColor].CGColor; sec.layer.masksToBounds=YES;
+    // Simple grouped header; use system colors so the panel adapts to light and dark mode.
+    UIView *header=[UIView new]; header.backgroundColor=[UIColor clearColor];
     UILabel *title=[UILabel new]; title.text=label; title.font=[UIFont boldSystemFontOfSize:13]; title.userInteractionEnabled=YES;
     UILabel *hint=[UILabel new]; hint.text=gSensorAdv[idx]?@"  ▼ 3-axis":@"  ▶︎ tap to expand 3-axis"; hint.font=[UIFont systemFontOfSize:10]; hint.textColor=[UIColor secondaryLabelColor];
     UISwitch *sw=[UISwitch new]; sw.on=gSensorEnabled[idx]; sw.tag=idx; sw.transform=CGAffineTransformMakeScale(0.7,0.7); [sw addTarget:self action:@selector(sensorToggle:) forControlEvents:UIControlEventValueChanged];
@@ -630,8 +628,8 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
 - (void)sensorToggle:(UISwitch*)s{ gSensorEnabled[s.tag]=s.isOn; }
 - (void)extraToggle:(UISwitch*)s{ gExtraEnabled[s.tag]=s.isOn; }
 - (UIView*)extraRowForKey:(NSString*)key label:(NSString*)lab idx:(int)eIdx{
-    UIView *row=[UIView new]; row.backgroundColor=[UIColor secondarySystemBackgroundColor]; row.layer.cornerRadius=10; row.layer.masksToBounds=YES;
-    UIView *abs=[self rowForKey:key label:lab min:-100 max:100];
+    UIView *row=[UIView new]; row.backgroundColor=[UIColor secondarySystemGroupedBackgroundColor]; row.layer.cornerRadius=10; row.layer.borderWidth=0.5; row.layer.borderColor=[UIColor separatorColor].CGColor; row.layer.masksToBounds=YES;
+    UIView *abs=[self rowForKey:key label:@"Scale" min:-100 max:100];
     UISwitch *sw=[UISwitch new]; sw.on=gExtraEnabled[eIdx]; sw.tag=eIdx; sw.transform=CGAffineTransformMakeScale(0.7,0.7); [sw addTarget:self action:@selector(extraToggle:) forControlEvents:UIControlEventValueChanged];
     UILabel *title=[UILabel new]; title.text=lab; title.font=[UIFont boldSystemFontOfSize:13];
     UIStackView *head=[[UIStackView alloc] initWithArrangedSubviews:@[title,[[UIView new] init],sw]]; head.axis=UILayoutConstraintAxisHorizontal;
@@ -641,22 +639,22 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     return row;
 }
 - (void)buildCard{
-    UILabel *t=[UILabel new]; t.text=@"SensorBender • Live"; t.font=[UIFont boldSystemFontOfSize:17]; t.textAlignment=NSTextAlignmentCenter; [_stack addArrangedSubview:t];
-    UILabel *sub=[UILabel new]; sub.text=@"Per-app motion and GPS controls. Tap sensor titles for X/Y/Z; tap values to type. Drag the MS button."; sub.font=[UIFont systemFontOfSize:10]; sub.textColor=[UIColor secondaryLabelColor]; sub.numberOfLines=0; sub.textAlignment=NSTextAlignmentCenter; [_stack addArrangedSubview:sub];
+    UILabel *t=[UILabel new]; t.text=@"SensorBender"; t.font=[UIFont systemFontOfSize:22 weight:UIFontWeightSemibold]; t.textAlignment=NSTextAlignmentLeft; [_stack addArrangedSubview:t];
+    UILabel *sub=[UILabel new]; sub.text=@"Motion and location controls"; sub.font=[UIFont systemFontOfSize:13]; sub.textColor=[UIColor secondaryLabelColor]; sub.numberOfLines=0; sub.textAlignment=NSTextAlignmentLeft; [_stack addArrangedSubview:sub];
     UIStackView *enRow=[UIStackView new]; enRow.axis=UILayoutConstraintAxisHorizontal; enRow.spacing=8;
-    UILabel *enL=[UILabel new]; enL.text=@"This App's Spoofing Enabled"; enL.font=[UIFont boldSystemFontOfSize:14];
+    UILabel *enL=[UILabel new]; enL.text=@"Enable for this app"; enL.font=[UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
     _enabledSwitch=[UISwitch new]; _enabledSwitch.on=gAppEnabled; [_enabledSwitch addTarget:self action:@selector(masterToggle:) forControlEvents:UIControlEventValueChanged];
     UIView *sp=[UIView new]; [sp setContentHuggingPriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
     [enRow addArrangedSubview:enL]; [enRow addArrangedSubview:sp]; [enRow addArrangedSubview:_enabledSwitch]; [_stack addArrangedSubview:enRow];
     UIView *sep=[UIView new]; sep.backgroundColor=[UIColor separatorColor]; [sep.heightAnchor constraintEqualToConstant:1].active=YES; [_stack addArrangedSubview:sep];
-    [_stack addArrangedSubview:[self section:@"PER-APP RAW SENSORS"]];
+    [_stack addArrangedSubview:[self section:@"Motion sensors"]];
     for(int i=0;i<3;i++) [_stack addArrangedSubview:[self sensorSectionForIdx:i]];
-    [_stack addArrangedSubview:[self section:@"DEVICE MOTION"]];
+    [_stack addArrangedSubview:[self section:@"Device motion"]];
     for(int i=3;i<8;i++) [_stack addArrangedSubview:[self sensorSectionForIdx:i]];
-    [_stack addArrangedSubview:[self section:@"PER-APP BAROMETER"]];
+    [_stack addArrangedSubview:[self section:@"Barometer"]];
     [_stack addArrangedSubview:[self extraRowForKey:@"pressure" label:@"Pressure" idx:E_PRESSURE]];
     [_stack addArrangedSubview:[self extraRowForKey:@"relAlt" label:@"Relative Alt" idx:E_RELALT]];
-    [_stack addArrangedSubview:[self section:@"GPS / LOCATION"]];
+    [_stack addArrangedSubview:[self section:@"Location"]];
     UIStackView *gpsEnabledRow=[UIStackView new]; gpsEnabledRow.axis=UILayoutConstraintAxisHorizontal; gpsEnabledRow.spacing=8;
     UILabel *gpsEnabledTitle=[UILabel new]; gpsEnabledTitle.text=@"Enable GPS adjustments"; gpsEnabledTitle.font=[UIFont boldSystemFontOfSize:13];
     UIView *gpsSpacer=[UIView new]; [gpsSpacer setContentHuggingPriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
@@ -668,7 +666,7 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     [_stack addArrangedSubview:[self rowForKey:@"gpsSpeed" label:@"GPS speed scale" min:0.1 max:1.0]];
     UILabel *gpsHint=[UILabel new]; gpsHint.text=@"Higher smoothing reduces fix-to-fix bounce. Speed scale slows the reported path, so it can trail the real fixes; it is separate from the accelerometer multiplier."; gpsHint.font=[UIFont systemFontOfSize:10]; gpsHint.textColor=[UIColor secondaryLabelColor]; gpsHint.numberOfLines=0; [_stack addArrangedSubview:gpsHint];
     // Button controls
-    [_stack addArrangedSubview:[self section:@"FLOATING BUTTON"]];
+    [_stack addArrangedSubview:[self section:@"Floating button"]];
     UIView *btnRow1=[self rowForKey:@"btnOpacity" label:@"Opacity" min:0.3 max:1.0];
     UIView *btnRow2=[self rowForKey:@"btnSize" label:@"Size" min:36 max:72];
     // override those sliders to control button
@@ -676,18 +674,18 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
     ((UISlider*)_sliders[@"btnSize"]).value=gBtnSize; ((UILabel*)_valueLabels[@"btnSize"]).text=[NSString stringWithFormat:@"%.0f",gBtnSize];
     [_stack addArrangedSubview:btnRow1]; [_stack addArrangedSubview:btnRow2];
     // Save
-    UIButton *save=[UIButton buttonWithType:UIButtonTypeSystem]; [save setTitle:@"💾 Save & Apply (persists)" forState:UIControlStateNormal]; save.titleLabel.font=[UIFont boldSystemFontOfSize:14]; save.backgroundColor=[UIColor systemBlueColor]; [save setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal]; save.layer.cornerRadius=11; [save.heightAnchor constraintEqualToConstant:46].active=YES; [save addTarget:self action:@selector(saveTap) forControlEvents:UIControlEventTouchUpInside]; [_stack addArrangedSubview:save];
+    UIButton *save=[UIButton buttonWithType:UIButtonTypeSystem]; [save setTitle:@"Save changes" forState:UIControlStateNormal]; save.titleLabel.font=[UIFont systemFontOfSize:15 weight:UIFontWeightSemibold]; save.backgroundColor=[UIColor systemBlueColor]; [save setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal]; save.layer.cornerRadius=10; [save.heightAnchor constraintEqualToConstant:44].active=YES; [save addTarget:self action:@selector(saveTap) forControlEvents:UIControlEventTouchUpInside]; [_stack addArrangedSubview:save];
     UIStackView *btns=[UIStackView new]; btns.axis=UILayoutConstraintAxisHorizontal; btns.spacing=8; btns.distribution=UIStackViewDistributionFillEqually;
-    UIButton *rst=[UIButton buttonWithType:UIButtonTypeSystem]; [rst setTitle:@"Reset Defaults" forState:UIControlStateNormal]; rst.backgroundColor=[UIColor secondarySystemFillColor]; rst.layer.cornerRadius=8; [rst.heightAnchor constraintEqualToConstant:40].active=YES; [rst addTarget:self action:@selector(resetTap) forControlEvents:UIControlEventTouchUpInside];
+    UIButton *rst=[UIButton buttonWithType:UIButtonTypeSystem]; [rst setTitle:@"Reset defaults" forState:UIControlStateNormal]; rst.backgroundColor=[UIColor secondarySystemFillColor]; rst.layer.cornerRadius=8; [rst.heightAnchor constraintEqualToConstant:40].active=YES; [rst addTarget:self action:@selector(resetTap) forControlEvents:UIControlEventTouchUpInside];
     UIButton *hide=[UIButton buttonWithType:UIButtonTypeSystem]; [hide setTitle:@"Close" forState:UIControlStateNormal]; hide.backgroundColor=[UIColor secondarySystemFillColor]; hide.layer.cornerRadius=8; [hide addTarget:self action:@selector(togglePanel) forControlEvents:UIControlEventTouchUpInside];
     [btns addArrangedSubview:rst]; [btns addArrangedSubview:hide]; [_stack addArrangedSubview:btns];
-    UIButton *rm=[UIButton buttonWithType:UIButtonTypeSystem]; [rm setTitle:@"Hide floating button until next launch" forState:UIControlStateNormal]; rm.titleLabel.font=[UIFont systemFontOfSize:11]; [rm setTitleColor:[UIColor secondaryLabelColor] forState:UIControlStateNormal]; [rm addTarget:self action:@selector(hideFloat) forControlEvents:UIControlEventTouchUpInside]; [_stack addArrangedSubview:rm];
+    UIButton *rm=[UIButton buttonWithType:UIButtonTypeSystem]; [rm setTitle:@"Hide floating button" forState:UIControlStateNormal]; rm.titleLabel.font=[UIFont systemFontOfSize:11]; [rm setTitleColor:[UIColor secondaryLabelColor] forState:UIControlStateNormal]; [rm addTarget:self action:@selector(hideFloat) forControlEvents:UIControlEventTouchUpInside]; [_stack addArrangedSubview:rm];
 }
-- (void)masterToggle:(UISwitch*)s{ gAppEnabled=s.isOn; MSResetGPSFilter(); }
-- (void)gpsAdjustmentsToggle:(UISwitch*)s{ gGPSAdjustmentsEnabled=s.isOn; MSResetGPSFilter(); }
+- (void)masterToggle:(UISwitch*)s{ gAppEnabled=s.isOn; SBResetGPSFilter(); }
+- (void)gpsAdjustmentsToggle:(UISwitch*)s{ gGPSAdjustmentsEnabled=s.isOn; SBResetGPSFilter(); }
 - (void)saveTap{
     gBtnOpacity=((UISlider*)_sliders[@"btnOpacity"]).value; gBtnSize=((UISlider*)_sliders[@"btnSize"]).value;
-    _floatBtn.alpha=gBtnOpacity; _floatBtn.backgroundColor=[UIColor colorWithRed:0.12 green:0.65 blue:0.95 alpha:gBtnOpacity];
+    _floatBtn.alpha=gBtnOpacity; _floatBtn.backgroundColor=[UIColor systemBlueColor];
     CGRect f=_floatBtn.frame; f.size=CGSizeMake(gBtnSize,gBtnSize); _floatBtn.layer.cornerRadius=gBtnSize/2; _floatBtn.frame=f;
     savePrefs();
     UIImpactFeedbackGenerator *g=[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium]; [g impactOccurred]; [self togglePanel];
@@ -702,7 +700,7 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
         if(!isAxis) [self setCur:resetValue key:k];
     }
     gAppEnabled=YES; _enabledSwitch.on=YES;
-    gGPSAdjustmentsEnabled=NO; _gpsAdjustmentsSwitch.on=NO; MSResetGPSFilter();
+    gGPSAdjustmentsEnabled=NO; _gpsAdjustmentsSwitch.on=NO; SBResetGPSFilter();
     savePrefs();
 }
 - (void)hideFloat{ _floatWindow.hidden=YES; _panelWindow.hidden=YES; }
@@ -742,8 +740,8 @@ static double lastRollS=0,lastPitchS=0,lastYawS=0;
 
 %ctor{
     loadPrefs();
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n){ dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1.0*NSEC_PER_SEC)),dispatch_get_main_queue(),^{ [[MSMotionOverlay shared] reconcileVisibility]; }); }];
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n){ [[MSMotionOverlay shared] reconcileVisibility]; }];
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n){ [[MSMotionOverlay shared] reconcileVisibility]; }];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1.5*NSEC_PER_SEC)),dispatch_get_main_queue(),^{ if([UIApplication sharedApplication].applicationState!=UIApplicationStateBackground) [[MSMotionOverlay shared] reconcileVisibility]; });
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n){ dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1.0*NSEC_PER_SEC)),dispatch_get_main_queue(),^{ [[SBSensorBenderOverlay shared] reconcileVisibility]; }); }];
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n){ [[SBSensorBenderOverlay shared] reconcileVisibility]; }];
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n){ [[SBSensorBenderOverlay shared] reconcileVisibility]; }];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1.5*NSEC_PER_SEC)),dispatch_get_main_queue(),^{ if([UIApplication sharedApplication].applicationState!=UIApplicationStateBackground) [[SBSensorBenderOverlay shared] reconcileVisibility]; });
 }
